@@ -1699,7 +1699,28 @@ const BADGES = [
 
 function earnedBadges(profile) {
   if(!profile) return [];
-  return BADGES.filter(b=>b.check(profile)).map(b=>b.id);
+  const safe = {total:0, log:[], ...profile};
+  return BADGES.filter(b=>{ try{return b.check(safe);}catch{return false;} }).map(b=>b.id);
+}
+
+// BadgeGrid — defined at module level (not inside RewardsView) to avoid Babel nested-component issues
+function BadgeGrid({profile}) {
+  const earned = earnedBadges(profile);
+  return (
+    <div className="badge-grid">
+      {BADGES.map(b=>{
+        const has = earned.includes(b.id);
+        return (
+          <div key={b.id} className={"badge-card"+(has?" earned":"")}>
+            <span className="badge-ico">{b.emoji}</span>
+            <div className="badge-name">{b.name}</div>
+            <div className="badge-desc">{b.desc}</div>
+            {has&&<div style={{marginTop:6,fontSize:9,color:"#ffd700",fontWeight:700}}>✓ Earned</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // Give points helper (shared storage)
@@ -1720,9 +1741,10 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
   const [manualStudent, setManualStudent] = useState("");
   const [manualPts, setManualPts]         = useState(5);
   const [manualReason, setManualReason]   = useState("");
-  const [quizRpts, setQuizRpts]           = useState({});  // { quizId: {qIdx: pts} }
+  const [quizRpts, setQuizRpts]           = useState({});
   const [quizList, setQuizList]           = useState([]);
   const [selQuizId, setSelQuizId]         = useState(null);
+  const [selClassFilter, setSelClassFilter] = useState(null); // teacher class filter for leaderboard
   const pollRef = useRef(null);
 
   useEffect(()=>{
@@ -1730,6 +1752,13 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
     pollRef.current = setInterval(load, 3000);
     return ()=>clearInterval(pollRef.current);
   },[]);
+
+  // Set default class filter to teacher's first class or student's own class
+  useEffect(()=>{
+    if(!curSess) return;
+    if(isTeacher && classes.length>0 && !selClassFilter) setSelClassFilter(classes[0].id);
+    if(!isTeacher && curSess.classId) setSelClassFilter(curSess.classId);
+  },[curSess, classes]);
 
   async function load() {
     const pts = LS.get("__shared__"+POINTS_KEY)||{};
@@ -1741,10 +1770,29 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
     if(!selQuizId && ql.length>0) setSelQuizId(ql[0].id);
   }
 
-  // Leaderboard: sorted by total pts
+  // Get all sessions to know which students belong to which class
+  const allSessions = LS.get(SESSIONS_KEY)||[];
+
+  // Build set of student IDs in the selected class
+  function studentIdsInClass(classId) {
+    if(!classId) return null; // null = all
+    // Sessions with classId, plus quizStudents with classId
+    const fromSessions = allSessions.filter(s=>s.classId===classId&&s.role==="student").map(s=>s.id);
+    const fromQStudents = quizStudents.filter(s=>s.classId===classId).map(s=>s.id);
+    return new Set([...fromSessions, ...fromQStudents]);
+  }
+
+  // Leaderboard: filtered by class, sorted by total pts
+  const classStudentIds = selClassFilter ? studentIdsInClass(selClassFilter) : null;
   const leaderboard = Object.entries(allPoints)
     .map(([id,p])=>({id,...p}))
+    .filter(e=> !classStudentIds || classStudentIds.has(e.id))
     .sort((a,b)=>(b.total||0)-(a.total||0));
+
+  // Students list for give-points: filtered by selected class
+  const filteredStudents = selClassFilter
+    ? quizStudents.filter(s=>s.classId===selClassFilter)
+    : quizStudents;
 
   const myProfile = curSess ? (allPoints[curSess.id]||{name:curSess.name,total:0,log:[]}) : null;
   const myBadges  = earnedBadges(myProfile);
@@ -1753,7 +1801,10 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
   function handleGivePoints(e) {
     e.preventDefault();
     if(!manualStudent||!manualPts) return;
-    const stu = quizStudents.find(s=>s.id===manualStudent)||{id:manualStudent,name:manualStudent};
+    // Look up in sessions too (not just quizStudents)
+    const fromQ = quizStudents.find(s=>s.id===manualStudent);
+    const fromS = allSessions.find(s=>s.id===manualStudent);
+    const stu = fromQ||fromS||{id:manualStudent,name:manualStudent};
     givePoints(stu.id, stu.name, Number(manualPts), manualReason||"Manual bonus", "manual");
     load();
     setManualReason("");
@@ -1768,26 +1819,7 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
   }
 
   const selQuiz = quizList.find(q=>q.id===selQuizId);
-
-  // My badges section (student or teacher seeing their own)
-  function BadgeGrid({profile}) {
-    const earned = earnedBadges(profile);
-    return (
-      <div className="badge-grid">
-        {BADGES.map(b=>{
-          const has = earned.includes(b.id);
-          return (
-            <div key={b.id} className={"badge-card"+(has?" earned":"")}>
-              <span className="badge-ico">{b.emoji}</span>
-              <div className="badge-name">{b.name}</div>
-              <div className="badge-desc">{b.desc}</div>
-              {has&&<div style={{marginTop:6,fontSize:9,color:"#ffd700",fontWeight:700}}>✓ Earned</div>}
-            </div>
-          );
-        })}
-      </div>
-    );
-  }
+  const selClassObj = classes.find(c=>c.id===selClassFilter);
 
   return (
     <div className="rw-wrap">
@@ -1809,7 +1841,17 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
         {tab==="leaderboard"&&(
           <div>
             <div style={{fontSize:20,fontWeight:800,marginBottom:4}}>🏆 Leaderboard</div>
-            <div style={{fontSize:12,color:"#5a7a94",marginBottom:20}}>Rankings update live every 3 seconds</div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:16,alignItems:"center"}}>
+              <span style={{fontSize:11,color:"#5a7a94"}}>Class:</span>
+              {isTeacher&&<div onClick={()=>setSelClassFilter(null)} style={{padding:"4px 12px",borderRadius:99,border:`1px solid ${!selClassFilter?"#4fc3f7":"#1e2d3d"}`,background:!selClassFilter?"#0d1e2e":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:!selClassFilter?"#4fc3f7":"#5a7a94"}}>All</div>}
+              {classes.map(c=>(
+                <div key={c.id} onClick={()=>setSelClassFilter(c.id)} style={{padding:"4px 12px",borderRadius:99,border:`1px solid ${selClassFilter===c.id?c.color:"#1e2d3d"}`,background:selClassFilter===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:selClassFilter===c.id?c.color:"#5a7a94",display:"flex",alignItems:"center",gap:5}}>
+                  <span style={{width:7,height:7,borderRadius:"50%",background:c.color,display:"inline-block"}}/>
+                  {c.name}
+                </div>
+              ))}
+              <span style={{fontSize:10,color:"#2d4a66",marginLeft:4}}>• updates every 3s</span>
+            </div>
             {leaderboard.length===0&&<div style={{color:"#2d4a66",fontSize:13,textAlign:"center",padding:"40px 0"}}>No points awarded yet — be the first! 🚀</div>}
             {leaderboard.map((entry,i)=>{
               const rank=i+1;
@@ -1847,8 +1889,16 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
             <div style={{fontSize:20,fontWeight:800,marginBottom:4}}>🎖️ Badges</div>
             {isTeacher?(
               <div>
-                <div style={{fontSize:12,color:"#5a7a94",marginBottom:16}}>See which badges each student has earned</div>
-                {leaderboard.length===0&&<div style={{color:"#2d4a66",fontSize:13}}>No students have points yet</div>}
+                <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14,alignItems:"center"}}>
+                  <span style={{fontSize:11,color:"#5a7a94"}}>Class:</span>
+                  <div onClick={()=>setSelClassFilter(null)} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${!selClassFilter?"#4fc3f7":"#1e2d3d"}`,background:!selClassFilter?"#0d1e2e":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:!selClassFilter?"#4fc3f7":"#5a7a94"}}>All</div>
+                  {classes.map(c=>(
+                    <div key={c.id} onClick={()=>setSelClassFilter(c.id)} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${selClassFilter===c.id?c.color:"#1e2d3d"}`,background:selClassFilter===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:selClassFilter===c.id?c.color:"#5a7a94",display:"flex",alignItems:"center",gap:4}}>
+                      <span style={{width:6,height:6,borderRadius:"50%",background:c.color,display:"inline-block"}}/>{c.name}
+                    </div>
+                  ))}
+                </div>
+                {leaderboard.length===0&&<div style={{color:"#2d4a66",fontSize:13}}>No students have points yet{selClassFilter?" for this class":""}</div>}
                 {leaderboard.map(entry=>(
                   <div key={entry.id} className="rw-card" style={{marginBottom:12}}>
                     <div style={{fontWeight:700,fontSize:13,marginBottom:10,display:"flex",alignItems:"center",gap:8}}>
@@ -1905,12 +1955,29 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
             <div className="rw-card">
               <div style={{fontSize:12,fontWeight:700,marginBottom:12,color:"#d6e4f0"}}>Award Points</div>
               <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {isTeacher&&classes.length>0&&(
+                  <div>
+                    <label className="flabel">Filter by Class</label>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                      <div onClick={()=>setSelClassFilter(null)} style={{padding:"4px 12px",borderRadius:99,border:`1px solid ${!selClassFilter?"#4fc3f7":"#1e2d3d"}`,background:!selClassFilter?"#0d1e2e":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:!selClassFilter?"#4fc3f7":"#5a7a94"}}>All</div>
+                      {classes.map(c=>(
+                        <div key={c.id} onClick={()=>{setSelClassFilter(c.id);setManualStudent("");}} style={{padding:"4px 12px",borderRadius:99,border:`1px solid ${selClassFilter===c.id?c.color:"#1e2d3d"}`,background:selClassFilter===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:selClassFilter===c.id?c.color:"#5a7a94",display:"flex",alignItems:"center",gap:5}}>
+                          <span style={{width:7,height:7,borderRadius:"50%",background:c.color,display:"inline-block"}}/>{c.name}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div>
-                  <label className="flabel">Student</label>
+                  <label className="flabel">Student{selClassObj?<span style={{color:selClassObj.color,marginLeft:4}}>({selClassObj.name})</span>:null}</label>
                   <select className="finput" value={manualStudent} onChange={e=>setManualStudent(e.target.value)}>
                     <option value="">— Select student —</option>
-                    {quizStudents.map(s=>(
+                    {(selClassFilter?filteredStudents:quizStudents).map(s=>(
                       <option key={s.id} value={s.id}>{s.name}</option>
+                    ))}
+                    {/* Also include session-based students in the class */}
+                    {(selClassFilter?allSessions.filter(s=>s.classId===selClassFilter&&s.role==="student"&&!quizStudents.find(q=>q.id===s.id)):[]).map(s=>(
+                      <option key={s.id} value={s.id}>{s.name} (session)</option>
                     ))}
                   </select>
                 </div>
@@ -1937,8 +2004,8 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
             </div>
 
             {/* All students' current totals */}
-            <div className="rw-section-hdr">All Students</div>
-            {leaderboard.length===0&&<div style={{color:"#2d4a66",fontSize:13}}>No points awarded yet</div>}
+            <div className="rw-section-hdr">All Students{selClassObj&&<span style={{color:selClassObj.color,fontWeight:400,marginLeft:6,fontSize:10}}>— {selClassObj.name}</span>}</div>
+            {leaderboard.length===0&&<div style={{color:"#2d4a66",fontSize:13}}>No points awarded yet{selClassFilter?" for this class":""}</div>}
             {leaderboard.map((entry,i)=>{
               const newBadges = earnedBadges(entry);
               return (
@@ -2067,13 +2134,13 @@ function Whiteboard({curSess, classes, isTeacher}) {
   const canvasRef = useRef(null);
   const dragRef   = useRef(null);
 
-  // Pick first class for students automatically
+  // Auto-select class from session for students; first class for teachers
   useEffect(()=>{
     if(!curSess) return;
     if(!isTeacher) {
-      // student: use their registered class (from quizStudents) — fall back to first class
-      const myClass = classes.find(c=>c.id===curSess.classId) || classes[0];
-      if(myClass) setSelClassId(myClass.id);
+      // Student: use classId baked into their session
+      if(curSess.classId) setSelClassId(curSess.classId);
+      else if(classes.length>0) setSelClassId(classes[0].id); // fallback for old sessions
     } else {
       if(classes.length>0 && !selClassId) setSelClassId(classes[0].id);
     }
@@ -2509,7 +2576,7 @@ function App() {
   const [tables,setTables]=useState([]);
   const [status,setStatus]=useState({type:"idle",msg:"Ready"});
   const [modal,setModal]=useState(null);
-  const [newSess,setNewSess]=useState({name:"",role:"student",color:"#4fc3f7"});
+  const [newSess,setNewSess]=useState({name:"",role:"student",color:"#4fc3f7",classId:null});
   const taRef=useRef(null);
   const [notif,setNotif]=useState(null);
 
@@ -3263,10 +3330,10 @@ function App() {
   }
   async function createSession(){
     if(!newSess.name.trim()||!sqlJS) return;
-    const s={id:uid(),name:newSess.name.trim(),role:newSess.role,color:newSess.color,created:new Date().toISOString()};
+    const s={id:uid(),name:newSess.name.trim(),role:newSess.role,color:newSess.color,classId:newSess.classId||null,created:new Date().toISOString()};
     const upd=[...sessions,s]; setSessions(upd); await store.set(SESSIONS_KEY,upd);
     const database=new sqlJS.Database(); dbRef.current=database; setDb(database); setCurSess(s); setTables([]); setResults([]); setQReg(null); setMReg(null);
-    await store.set(CURRENT_KEY,s.id); setNewSess({name:"",role:"student",color:"#4fc3f7"}); setModal(null); notify(`Session created: ${s.name}`);
+    await store.set(CURRENT_KEY,s.id); setNewSess({name:"",role:"student",color:"#4fc3f7",classId:null}); setModal(null); notify(`Session created: ${s.name}`);
   }
   async function deleteSession(id,e){
     e.stopPropagation();
@@ -3577,21 +3644,27 @@ function App() {
                 <div className="reg-screen"><div className="reg-card" style={{maxWidth:380}}>
                   <div style={{fontSize:38,marginBottom:10}}>📝</div>
                   <div style={{fontSize:17,fontWeight:800,marginBottom:5}}>Join Quizzes</div>
-                  <div style={{fontSize:12,color:T.muted,marginBottom:16}}>Enter your name and select your class</div>
-                  <input className="finput" style={{marginBottom:12,textAlign:"center",fontSize:14}} placeholder="Your full name" value={qRegName} onChange={e=>setQRegName(e.target.value)} autoFocus/>
+                  <div style={{fontSize:12,color:T.muted,marginBottom:16}}>Confirm your name and class to join quizzes</div>
+                  <input className="finput" style={{marginBottom:12,textAlign:"center",fontSize:14}} placeholder="Your full name"
+                    value={qRegName||curSess?.name||""}
+                    onChange={e=>setQRegName(e.target.value)} autoFocus/>
                   <div style={{marginBottom:14}}>
-                    <div style={{fontSize:10,color:T.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Select your class</div>
+                    <div style={{fontSize:10,color:T.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Your class</div>
                     <div style={{display:"flex",flexDirection:"column",gap:6}}>
                       {classes.map(c=>(
-                        <div key={c.id} onClick={()=>setCurClassId(c.id)} style={{padding:"9px 13px",borderRadius:8,border:`2px solid ${curClassId===c.id?c.color:T.border}`,background:curClassId===c.id?c.color+"18":"transparent",cursor:"pointer",display:"flex",alignItems:"center",gap:9,transition:"all .15s"}}>
+                        <div key={c.id}
+                          onClick={()=>setCurClassId(c.id)}
+                          style={{padding:"9px 13px",borderRadius:8,border:`2px solid ${(curClassId||curSess?.classId)===c.id?c.color:T.border}`,background:(curClassId||curSess?.classId)===c.id?c.color+"18":"transparent",cursor:"pointer",display:"flex",alignItems:"center",gap:9,transition:"all .15s"}}>
                           <span className="class-dot" style={{background:c.color,width:12,height:12}}/>
                           <span style={{fontSize:13,fontWeight:600,flex:1}}>{c.name}</span>
-                          {curClassId===c.id&&<span style={{color:c.color,fontSize:14}}>✓</span>}
+                          {(curClassId||curSess?.classId)===c.id&&<span style={{color:c.color,fontSize:14}}>✓</span>}
                         </div>
                       ))}
                     </div>
                   </div>
-                  <button className="btn btn-purple" style={{width:"100%",justifyContent:"center",padding:"8px 0",fontSize:13}} onClick={()=>registerQuizStudent(curClassId)} disabled={!qRegName.trim()||!curClassId}>Register & Start</button>
+                  <button className="btn btn-purple" style={{width:"100%",justifyContent:"center",padding:"8px 0",fontSize:13}}
+                    onClick={()=>registerQuizStudent(curClassId||curSess?.classId)}
+                    disabled={!(qRegName||curSess?.name)||!(curClassId||curSess?.classId)}>Register & Start</button>
                 </div></div>
               )
               :(()=>{
@@ -3655,7 +3728,7 @@ function App() {
                 :sessions.map(s=>(
                   <div key={s.id} className={`sc ${curSess?.id===s.id?"sc-active":""}`} onClick={()=>{activateSession(s);setModal(null);}}>
                     <div className="sc-ico" style={{background:s.color+"25"}}>{s.role==="teacher"?"👨‍🏫":"👨‍💻"}</div>
-                    <div className="sc-info"><div className="sc-name">{s.name}<span className={`tag ${s.role==="teacher"?"tag-t":"tag-s"}`}>{s.role}</span></div><div className="sc-meta">{new Date(s.created).toLocaleDateString()}</div></div>
+                    <div className="sc-info"><div className="sc-name">{s.name}<span className={`tag ${s.role==="teacher"?"tag-t":"tag-s"}`}>{s.role}</span>{s.classId&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:99,background:(classes.find(c=>c.id===s.classId)?.color||"#4fc3f7")+"22",color:classes.find(c=>c.id===s.classId)?.color||"#4fc3f7",fontWeight:700,marginLeft:4}}>{classes.find(c=>c.id===s.classId)?.name||"Class"}</span>}</div><div className="sc-meta">{new Date(s.created).toLocaleDateString()}</div></div>
                     {curSess?.id===s.id&&<span style={{fontSize:10,color:T.green}}>● Active</span>}
                     <button className="xbtn" onClick={e=>deleteSession(s.id,e)}>🗑</button>
                   </div>
@@ -3671,10 +3744,27 @@ function App() {
             <div className="mhdr"><span>New Session</span><button className="xbtn" onClick={()=>setModal("sessions")}>✕</button></div>
             <div className="mbody">
               <div className="fg"><label className="flabel">Your Name</label><input className="finput" autoFocus placeholder="e.g. Alice Johnson" value={newSess.name} onChange={e=>setNewSess(p=>({...p,name:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&createSession()}/><div className="fhint">Each session has its own isolated SQLite database</div></div>
-              <div className="fg"><label className="flabel">Role</label><div style={{display:"flex",gap:8}}>{["student","teacher"].map(r=><button key={r} className={`btn ${newSess.role===r?"btn-run":"btn-ghost"}`} onClick={()=>setNewSess(p=>({...p,role:r}))} style={{flex:1,justifyContent:"center"}}>{r==="teacher"?"👨‍🏫 Teacher":"👨‍💻 Student"}</button>)}</div></div>
+              <div className="fg"><label className="flabel">Role</label><div style={{display:"flex",gap:8}}>{["student","teacher"].map(r=><button key={r} className={`btn ${newSess.role===r?"btn-run":"btn-ghost"}`} onClick={()=>setNewSess(p=>({...p,role:r,classId:r==="teacher"?null:p.classId}))} style={{flex:1,justifyContent:"center"}}>{r==="teacher"?"👨‍🏫 Teacher":"👨‍💻 Student"}</button>)}</div></div>
+              {newSess.role==="student"&&(
+                <div className="fg">
+                  <label className="flabel">Class</label>
+                  {classes.length===0
+                    ?<div className="fhint" style={{color:"#ff5370"}}>No classes yet — ask your teacher to create one first</div>
+                    :<div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                      {classes.map(c=>(
+                        <div key={c.id} onClick={()=>setNewSess(p=>({...p,classId:c.id}))}
+                          style={{padding:"6px 14px",borderRadius:99,border:`2px solid ${newSess.classId===c.id?c.color:"#1e2d3d"}`,background:newSess.classId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:12,fontWeight:700,color:newSess.classId===c.id?c.color:"#5a7a94",transition:"all .15s",display:"flex",alignItems:"center",gap:6}}>
+                          <span style={{width:8,height:8,borderRadius:"50%",background:c.color,display:"inline-block"}}/>
+                          {c.name}
+                        </div>
+                      ))}
+                    </div>
+                  }
+                </div>
+              )}
               <div className="fg"><label className="flabel">Colour</label><div style={{display:"flex",gap:8}}>{COLORS.map(c=><div key={c} onClick={()=>setNewSess(p=>({...p,color:c}))} style={{width:24,height:24,borderRadius:"50%",background:c,cursor:"pointer",border:newSess.color===c?"3px solid white":"3px solid transparent",boxShadow:newSess.color===c?`0 0 0 2px ${c}`:"none",transition:"all .15s"}}/> )}</div></div>
             </div>
-            <div className="mftr"><button className="btn btn-ghost btn-sm" onClick={()=>setModal("sessions")}>Cancel</button><button className="btn btn-run" onClick={createSession} disabled={!newSess.name.trim()}>Create Session</button></div>
+            <div className="mftr"><button className="btn btn-ghost btn-sm" onClick={()=>setModal("sessions")}>Cancel</button><button className="btn btn-run" onClick={createSession} disabled={!newSess.name.trim()||(newSess.role==="student"&&!newSess.classId&&classes.length>0)}>Create Session</button></div>
           </div>
         </div>
       )}
