@@ -744,15 +744,15 @@ function mergeSharedTables(studentDb, sqlJS) {
       var tname = row[0]; var ddl = row[1];
       if(!tname||!ddl) return;
       try {
-        var safeDdl = ddl.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ");
-        safeDdl = safeDdl.replace("CREATE TABLE	", "CREATE TABLE IF NOT EXISTS ");
-        studentDb.run(safeDdl);
+        // Always drop and recreate so students get the exact latest schema+data
+        studentDb.run("DROP TABLE IF EXISTS ["+tname+"]");
+        studentDb.run(ddl);
         var dataRes = teacherDb.exec("SELECT * FROM ["+tname+"]");
         if(!dataRes.length) return;
         var cols = dataRes[0].columns;
         var ph = cols.map(function(){return "?";}).join(",");
         var colList = cols.map(function(c){return "["+c+"]";}).join(",");
-        var ins = "INSERT OR IGNORE INTO ["+tname+"] ("+colList+") VALUES ("+ph+")";
+        var ins = "INSERT INTO ["+tname+"] ("+colList+") VALUES ("+ph+")";
         dataRes[0].values.forEach(function(r){ try{studentDb.run(ins,r);}catch(e2){} });
       } catch(e){}
     });
@@ -1773,11 +1773,28 @@ function givePoints(studentId, studentName, pts, reason, source="manual") {
   LS.set("__shared__"+POINTS_KEY, all);
   return updated;
 }
+function deleteAllPoints(studentId) {
+  const all = LS.get("__shared__"+POINTS_KEY) || {};
+  delete all[studentId];
+  LS.set("__shared__"+POINTS_KEY, all);
+}
+function deletePointsEntry(studentId, entryIndex) {
+  const all = LS.get("__shared__"+POINTS_KEY) || {};
+  const prof = all[studentId];
+  if(!prof) return;
+  const removed = (prof.log||[])[entryIndex];
+  if(!removed) return;
+  prof.log = (prof.log||[]).filter((_,i)=>i!==entryIndex);
+  prof.total = Math.max(0, (prof.total||0) - removed.pts);
+  all[studentId] = prof;
+  LS.set("__shared__"+POINTS_KEY, all);
+}
 
 // ─── Rewards View Component ───────────────────────────────────────────────────
 function RewardsView({curSess, isTeacher, quizStudents, classes}) {
   const [tab, setTab]           = useState("leaderboard");
   const [allPoints, setAllPoints] = useState({});
+  const [expandedRow, setExpandedRow] = useState(null); // studentId expanded in leaderboard
   const [manualStudent, setManualStudent] = useState("");
   const [manualPts, setManualPts]         = useState(5);
   const [manualReason, setManualReason]   = useState("");
@@ -1898,25 +1915,43 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
               const isMe=entry.id===curSess?.id;
               const badges=earnedBadges(entry);
               const rankCls=rank===1?"top1":rank===2?"top2":rank===3?"top3":"";
+              const isExpanded=expandedRow===entry.id;
               return (
-                <div key={entry.id} className={"lb-row"+(isMe?" me":"")}>
-                  <div className={"lb-rank "+rankCls}>
-                    {rank<=3?["🥇","🥈","🥉"][rank-1]:rank}
-                  </div>
-                  <div>
-                    <div style={{fontWeight:700,fontSize:13,color:"#d6e4f0"}}>{entry.name}{isMe&&<span style={{marginLeft:6,fontSize:9,color:"#4fc3f7",background:"#0d1e2e",padding:"1px 6px",borderRadius:99,fontWeight:700}}>YOU</span>}</div>
-                    <div style={{display:"flex",gap:3,marginTop:3,flexWrap:"wrap"}}>
-                      {badges.slice(0,6).map(bid=>{
-                        const b=BADGES.find(x=>x.id===bid);
-                        return b?<span key={bid} title={b.name} style={{fontSize:14}}>{b.emoji}</span>:null;
-                      })}
-                      {badges.length>6&&<span style={{fontSize:10,color:"#5a7a94"}}>+{badges.length-6}</span>}
+                <div key={entry.id} style={{marginBottom:6}}>
+                  <div className={"lb-row"+(isMe?" me":"")} style={{cursor:isTeacher?"pointer":"default"}} onClick={()=>isTeacher&&setExpandedRow(isExpanded?null:entry.id)}>
+                    <div className={"lb-rank "+rankCls}>
+                      {rank<=3?["🥇","🥈","🥉"][rank-1]:rank}
                     </div>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:700,fontSize:13,color:"#d6e4f0"}}>{entry.name}{isMe&&<span style={{marginLeft:6,fontSize:9,color:"#4fc3f7",background:"#0d1e2e",padding:"1px 6px",borderRadius:99,fontWeight:700}}>YOU</span>}</div>
+                      <div style={{display:"flex",gap:3,marginTop:3,flexWrap:"wrap"}}>
+                        {badges.slice(0,6).map(bid=>{
+                          const b=BADGES.find(x=>x.id===bid);
+                          return b?<span key={bid} title={b.name} style={{fontSize:14}}>{b.emoji}</span>:null;
+                        })}
+                        {badges.length>6&&<span style={{fontSize:10,color:"#5a7a94"}}>+{badges.length-6}</span>}
+                      </div>
+                    </div>
+                    <div style={{fontSize:11,color:"#5a7a94",textAlign:"right",paddingRight:4}}>
+                      {(entry.log||[]).length} entries
+                      {isTeacher&&<span style={{marginLeft:6,fontSize:10,color:isExpanded?"#4fc3f7":"#2d4a66"}}>{isExpanded?"▲":"▼"}</span>}
+                    </div>
+                    <div className="lb-pts">{entry.total||0}<span style={{fontSize:10,color:"#5a7a94",fontWeight:400,marginLeft:2}}>pts</span></div>
+                    {isTeacher&&<button className="xbtn" title="Delete all points for this student" style={{color:"#ff5370",marginLeft:4}} onClick={e=>{e.stopPropagation();if(confirm("Delete ALL points for "+entry.name+"?")){ deleteAllPoints(entry.id); load(); setExpandedRow(null); }}}>🗑</button>}
                   </div>
-                  <div style={{fontSize:11,color:"#5a7a94",textAlign:"right",paddingRight:4}}>
-                    {(entry.log||[]).length} entries
-                  </div>
-                  <div className="lb-pts">{entry.total||0}<span style={{fontSize:10,color:"#5a7a94",fontWeight:400,marginLeft:2}}>pts</span></div>
+                  {isTeacher&&isExpanded&&(
+                    <div style={{background:"#080f1a",border:"1px solid #1e2d3d",borderTop:"none",borderRadius:"0 0 8px 8px",padding:"8px 12px"}}>
+                      {(entry.log||[]).length===0&&<div style={{fontSize:11,color:"#2d4a66",padding:"6px 0"}}>No log entries</div>}
+                      {(entry.log||[]).map((lg,li)=>(
+                        <div key={li} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 0",borderBottom:li<entry.log.length-1?"1px solid #0d1b2a":"none"}}>
+                          <span style={{fontSize:11,fontWeight:700,color:"#43d98c",minWidth:36}}>+{lg.pts}</span>
+                          <span style={{flex:1,fontSize:11,color:"#7a9ab5",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{lg.reason}</span>
+                          <span style={{fontSize:9,color:"#2d4a66",whiteSpace:"nowrap"}}>{lg.at?new Date(lg.at).toLocaleDateString():""}</span>
+                          <button className="xbtn" title="Remove this entry" style={{color:"#ff5370",fontSize:10,padding:"1px 4px"}} onClick={()=>{ deletePointsEntry(entry.id,li); load(); }}>✕</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -2758,7 +2793,7 @@ function LoginScreen({classes, onLoginTeacher, onLoginStudent, onRegisterStudent
 function App() {
   const [sqlJS,setSqlJS]=useState(null);
   const [loading,setLoading]=useState(true);
-  const [loginScreen,setLoginScreen]=useState(false); // show login before curSess is set
+  const [loginScreen,setLoginScreen]=useState(true); // true = show login as first screen
   const [view,setView]=useState("ide");
   const [sessions,setSessions]=useState([]);
   const [curSess,setCurSess]=useState(null);
@@ -2836,11 +2871,16 @@ function App() {
 
   useEffect(()=>{
     clearInterval(pollRef.current);
-    if(view==="marathon"||view==="quiz"||view==="whiteboard"||view==="rewards"){
+    if(view==="marathon"||view==="quiz"||view==="whiteboard"||view==="rewards"||view==="ide"){
       pollRef.current=setInterval(async()=>{
-        refreshMarathon();refreshQuizData();
+        if(view!=="ide"){ refreshMarathon(); refreshQuizData(); }
         const cls=await store.get(CLASSES_KEY,true)||[];
         setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
+        // Students: re-sync teacher's shared tables every 4s so they always have latest
+        if(curSess?.role==="student" && db && sqlJS){
+          mergeSharedTables(db, sqlJS);
+          refreshTables(db);
+        }
       },4000);
     }
     return()=>clearInterval(pollRef.current);
@@ -3543,7 +3583,16 @@ function App() {
     // Sync in-memory sessions list too
     setSessions(allSess);
     await store.set(CURRENT_KEY,freshSess.id);
-    const qs=await store.get(QSTUDENTS_KEY,true)||[]; setQReg(qs.find(s=>s.sessionId===freshSess.id)||null);
+    const qs=await store.get(QSTUDENTS_KEY,true)||[];
+    let existingQReg=qs.find(s=>s.sessionId===freshSess.id)||null;
+    // Auto-register student into quizzes on login if not already registered
+    if(freshSess.role==="student" && !existingQReg && freshSess.classId){
+      const st={id:freshSess.id+"-q-auto",name:freshSess.name,sessionId:freshSess.id,classId:freshSess.classId,joinedAt:new Date().toISOString()};
+      const upd=[...qs.filter(s=>s.sessionId!==freshSess.id),st];
+      await store.set(QSTUDENTS_KEY,upd,true);
+      existingQReg=st;
+    }
+    setQReg(existingQReg);
     const ms=await store.get(M_STUDENTS,true)||[]; setMReg(ms.find(s=>s.sessionId===freshSess.id)||null);
   }
   function refreshTables(database){
@@ -3619,13 +3668,26 @@ function App() {
     const sessId = uid();
     const rec={id:uid(),sessionId:sessId,name:name.trim(),passHash:simpleHash(password),classId,color,created:new Date().toISOString()};
     const newStuds=[...studs,rec]; saveStudents(newStuds);
-    // Create session
     const sess={id:sessId,name:rec.name,role:"student",color,classId,created:rec.created};
     const allSess=LS.get(SESSIONS_KEY)||[];
     const upd=[...allSess,sess]; LS.set(SESSIONS_KEY,upd); setSessions(upd);
     await activateSession(sess,sqlJS);
     await refreshMarathon(sess.id); await refreshQuizData(sess.id);
     setLoginScreen(false); notify("Account created! Welcome, "+rec.name+" 🎉");
+    return "ok";
+  }
+
+  // Teacher-side: create student account without switching to their session
+  function createStudentAccount(name, password, classId, color){
+    const studs = LS.get("__shared__"+STUDENTS_KEY)||[];
+    if(studs.some(s=>s.name.toLowerCase()===name.toLowerCase())) return "exists";
+    const sessId = uid();
+    const rec={id:uid(),sessionId:sessId,name:name.trim(),passHash:simpleHash(password),classId,color,created:new Date().toISOString()};
+    saveStudents([...studs,rec]);
+    const sess={id:sessId,name:rec.name,role:"student",color,classId,created:rec.created};
+    const allSess=LS.get(SESSIONS_KEY)||[];
+    LS.set(SESSIONS_KEY,[...allSess,sess]); setSessions([...allSess,sess]);
+    notify("Student account created: "+rec.name+" ✓");
     return "ok";
   }
 
@@ -3637,8 +3699,8 @@ function App() {
   }
 
   function deleteStudent(sid, e){
-    e.stopPropagation();
-    if(!confirm("Delete student account? This also removes their session and database.")) return;
+    if(e) e.stopPropagation();
+    if(!confirm("Delete student account? This removes their session, database, and all points.")) return;
     const studs=LS.get("__shared__"+STUDENTS_KEY)||[];
     const rec=studs.find(s=>s.id===sid); if(!rec) return;
     saveStudents(studs.filter(s=>s.id!==sid));
@@ -3646,6 +3708,8 @@ function App() {
     const allSess=LS.get(SESSIONS_KEY)||[];
     const upd=allSess.filter(s=>s.id!==rec.sessionId); LS.set(SESSIONS_KEY,upd); setSessions(upd);
     LS.del(DB_PFX+rec.sessionId);
+    // Remove points
+    deleteAllPoints(rec.sessionId);
     notify("Student deleted");
   }
 
@@ -3997,36 +4061,9 @@ function App() {
                   })()}
                 </div>
               </div>
-            ):!curSess?<div className="reg-screen"><div className="reg-card"><div style={{fontSize:38,marginBottom:10}}>🔒</div><div style={{fontSize:17,fontWeight:800,marginBottom:5}}>Session Required</div><button className="btn btn-run" onClick={()=>setModal("sessions")}>Open Sessions</button></div></div>
-              :classes.length===0?<div className="empty" style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}><div className="empty-ico">⏳</div><div style={{marginBottom:10,fontSize:13}}>No classes set up yet — ask your teacher</div><button className="btn btn-ghost" onClick={refreshQuizData}>↻ Refresh</button></div>
-              :!qReg?(
-                <div className="reg-screen"><div className="reg-card" style={{maxWidth:380}}>
-                  <div style={{fontSize:38,marginBottom:10}}>📝</div>
-                  <div style={{fontSize:17,fontWeight:800,marginBottom:5}}>Join Quizzes</div>
-                  <div style={{fontSize:12,color:T.muted,marginBottom:16}}>Confirm your name and class to join quizzes</div>
-                  <input className="finput" style={{marginBottom:12,textAlign:"center",fontSize:14}} placeholder="Your full name"
-                    value={qRegName||curSess?.name||""}
-                    onChange={e=>setQRegName(e.target.value)} autoFocus/>
-                  <div style={{marginBottom:14}}>
-                    <div style={{fontSize:10,color:T.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:8}}>Your class</div>
-                    <div style={{display:"flex",flexDirection:"column",gap:6}}>
-                      {classes.map(c=>(
-                        <div key={c.id}
-                          onClick={()=>setCurClassId(c.id)}
-                          style={{padding:"9px 13px",borderRadius:8,border:`2px solid ${(curClassId||curSess?.classId)===c.id?c.color:T.border}`,background:(curClassId||curSess?.classId)===c.id?c.color+"18":"transparent",cursor:"pointer",display:"flex",alignItems:"center",gap:9,transition:"all .15s"}}>
-                          <span className="class-dot" style={{background:c.color,width:12,height:12}}/>
-                          <span style={{fontSize:13,fontWeight:600,flex:1}}>{c.name}</span>
-                          {(curClassId||curSess?.classId)===c.id&&<span style={{color:c.color,fontSize:14}}>✓</span>}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                  <button className="btn btn-purple" style={{width:"100%",justifyContent:"center",padding:"8px 0",fontSize:13}}
-                    onClick={()=>registerQuizStudent(curClassId||curSess?.classId)}
-                    disabled={!(qRegName||curSess?.name)||!(curClassId||curSess?.classId)}>Register & Start</button>
-                </div></div>
-              )
+            ):!curSess?<div className="reg-screen"><div className="reg-card"><div style={{fontSize:38,marginBottom:10}}>🔒</div><div style={{fontSize:17,fontWeight:800,marginBottom:5}}>Please sign in</div><div style={{fontSize:12,color:T.muted}}>Use the login page to access quizzes</div></div></div>
               :(()=>{
+                if(!qReg) return <div className="reg-screen"><div className="reg-card"><div style={{fontSize:38,marginBottom:10}}>⏳</div><div style={{fontSize:17,fontWeight:800,marginBottom:5}}>Setting up...</div><div style={{fontSize:12,color:T.muted,marginBottom:14}}>Your quiz registration is being prepared</div><button className="btn btn-ghost" onClick={refreshQuizData}>↻ Refresh</button></div></div>;
                 const myClass=classes.find(c=>c.id===qReg.classId);
                 const myQuizzes=quizList.filter(q=>q.classId===qReg.classId);
                 return (
@@ -4125,16 +4162,112 @@ function App() {
 
       {modal==="students"&&(()=>{
         const studs=students;
+        const SCOLS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4"];
         const [resetTarget,setResetTarget]=useState(null);
         const [newPass,setNewPass]=useState("");
+        const [showAdd,setShowAdd]=useState(false);
+        const [addName,setAddName]=useState("");
+        const [addPass,setAddPass]=useState("");
+        const [addClassId,setAddClassId]=useState(classes[0]?.id||"");
+        const [addColor,setAddColor]=useState("#4fc3f7");
+        const [addErr,setAddErr]=useState("");
+        const [filterClass,setFilterClass]=useState("all");
+
+        function exportStudentsExcel(){
+          try {
+            const rows=[["Name","Class","Joined","Colour"]];
+            studs.forEach(s=>{
+              const cls=classes.find(c=>c.id===s.classId);
+              rows.push([s.name,cls?cls.name:"—",new Date(s.created).toLocaleDateString(),s.color]);
+            });
+            const ws=XLSX.utils.aoa_to_sheet(rows);
+            ws["!cols"]=[{wch:24},{wch:18},{wch:14},{wch:10}];
+            const wb=XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb,"Students",ws);
+            const b64=XLSX.write(wb,{bookType:"xlsx",type:"base64"});
+            const a=document.createElement("a");
+            a.href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"+b64;
+            a.download="students.xlsx"; a.click();
+          } catch(e){ alert("Export failed: "+e.message); }
+        }
+
+        function handleAddStudent(){
+          setAddErr("");
+          if(!addName.trim()||!addPass.trim()||!addClassId){setAddErr("Fill in all fields");return;}
+          if(addPass.length<3){setAddErr("Password must be at least 3 characters");return;}
+          const res=createStudentAccount(addName.trim(),addPass,addClassId,addColor);
+          if(res==="exists"){setAddErr("A student with that name already exists");return;}
+          setAddName(""); setAddPass(""); setAddErr(""); setShowAdd(false);
+          setStudents(LS.get("__shared__"+STUDENTS_KEY)||[]);
+        }
+
+        const visibleStuds=filterClass==="all"?studs:studs.filter(s=>s.classId===filterClass);
+
         return (
           <div className="overlay" onClick={()=>setModal(null)}>
-            <div className="modal modal-lg" onClick={e=>e.stopPropagation()} style={{maxWidth:560}}>
-              <div className="mhdr"><span>👥 Student Accounts</span><button className="xbtn" onClick={()=>setModal(null)}>✕</button></div>
-              <div className="mbody" style={{maxHeight:"65vh"}}>
-                {studs.length===0
-                  ?<div className="empty"><div className="empty-ico">👥</div><div>No students yet — they register on the login page</div></div>
-                  :studs.map(stu=>{
+            <div className="modal modal-lg" onClick={e=>e.stopPropagation()} style={{maxWidth:600,display:"flex",flexDirection:"column",maxHeight:"88vh"}}>
+              <div className="mhdr">
+                <span>👥 Student Accounts</span>
+                <div style={{display:"flex",gap:6,marginLeft:"auto",marginRight:8}}>
+                  <button className="btn btn-green btn-sm" onClick={exportStudentsExcel}>📥 Export Excel</button>
+                  <button className="btn btn-run btn-sm" onClick={()=>{setShowAdd(!showAdd);setAddErr("");}}>
+                    {showAdd?"✕ Cancel":"+ Add Student"}
+                  </button>
+                </div>
+                <button className="xbtn" onClick={()=>setModal(null)}>✕</button>
+              </div>
+
+              {/* Add student form */}
+              {showAdd&&(
+                <div style={{padding:"16px 20px",borderBottom:"1px solid #1e2d3d",background:"#0a1628"}}>
+                  <div style={{fontSize:10,fontWeight:700,color:"#4fc3f7",textTransform:"uppercase",letterSpacing:1,marginBottom:12}}>New Student</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                    <div>
+                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Full Name</label>
+                      <input value={addName} onChange={e=>setAddName(e.target.value)} placeholder="e.g. Alice Johnson"
+                        style={{width:"100%",padding:"8px 10px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:6,color:"#d6e4f0",fontSize:12,boxSizing:"border-box"}} autoFocus/>
+                    </div>
+                    <div>
+                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Password</label>
+                      <input type="password" value={addPass} onChange={e=>setAddPass(e.target.value)} placeholder="••••••"
+                        style={{width:"100%",padding:"8px 10px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:6,color:"#d6e4f0",fontSize:12,boxSizing:"border-box"}}/>
+                    </div>
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10,alignItems:"end"}}>
+                    <div>
+                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Class</label>
+                      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                        {classes.map(c=>(
+                          <div key={c.id} onClick={()=>setAddClassId(c.id)} style={{padding:"5px 12px",borderRadius:99,border:`2px solid ${addClassId===c.id?c.color:"#1e2d3d"}`,background:addClassId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:addClassId===c.id?c.color:"#3d5a73",transition:"all .15s"}}>
+                            {c.name}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Colour</label>
+                      <div style={{display:"flex",gap:5}}>
+                        {SCOLS.map(c=><div key={c} onClick={()=>setAddColor(c)} style={{width:18,height:18,borderRadius:"50%",background:c,cursor:"pointer",border:addColor===c?"2px solid white":"2px solid transparent",boxShadow:addColor===c?`0 0 0 1px ${c}`:"none"}}/>)}
+                      </div>
+                    </div>
+                  </div>
+                  {addErr&&<div style={{marginTop:8,fontSize:11,color:"#ff5370"}}>{addErr}</div>}
+                  <button className="btn btn-run btn-sm" style={{marginTop:12}} onClick={handleAddStudent}>Create Account</button>
+                </div>
+              )}
+
+              {/* Class filter bar */}
+              {classes.length>1&&(
+                <div style={{display:"flex",gap:6,padding:"10px 20px 0",flexWrap:"wrap"}}>
+                  <div onClick={()=>setFilterClass("all")} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass==="all"?"#4fc3f7":"#1e2d3d"}`,background:filterClass==="all"?"#4fc3f722":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass==="all"?"#4fc3f7":"#3d5a73"}}>All</div>
+                  {classes.map(c=><div key={c.id} onClick={()=>setFilterClass(c.id)} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass===c.id?c.color:"#1e2d3d"}`,background:filterClass===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass===c.id?c.color:"#3d5a73"}}>{c.name}</div>)}
+                </div>
+              )}
+
+              <div className="mbody" style={{flex:1,overflowY:"auto"}}>
+                {visibleStuds.length===0
+                  ?<div className="empty"><div className="empty-ico">👥</div><div>{studs.length===0?"No students yet — add one above or have them register":"No students in this class"}</div></div>
+                  :visibleStuds.map(stu=>{
                     const cls=classes.find(c=>c.id===stu.classId);
                     return (
                       <div key={stu.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 12px",borderRadius:8,background:"#0d1b2a",border:"1px solid #1e2d3d",marginBottom:8}}>
@@ -4148,14 +4281,16 @@ function App() {
                         </div>
                         {resetTarget===stu.id?(
                           <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                            <input placeholder="New password" value={newPass} onChange={e=>setNewPass(e.target.value)} style={{padding:"5px 8px",background:"#0a1628",border:"1px solid #1e2d3d",borderRadius:5,color:"#d6e4f0",fontSize:11,width:120}}/>
+                            <input placeholder="New password" value={newPass} onChange={e=>setNewPass(e.target.value)}
+                              style={{padding:"5px 8px",background:"#0a1628",border:"1px solid #1e2d3d",borderRadius:5,color:"#d6e4f0",fontSize:11,width:120}}/>
                             <button className="btn btn-green btn-sm" onClick={()=>{if(newPass.length>=3){resetStudentPassword(stu.id,newPass);setResetTarget(null);setNewPass("");}}} style={{padding:"5px 10px"}}>Save</button>
                             <button className="btn btn-ghost btn-sm" onClick={()=>{setResetTarget(null);setNewPass("");}} style={{padding:"5px 10px"}}>✕</button>
                           </div>
                         ):(
-                          <div style={{display:"flex",gap:6}}>
-                            <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>setResetTarget(stu.id)}>🔑 Reset</button>
-                            <button className="xbtn" onClick={e=>deleteStudent(stu.id,e)}>🗑</button>
+                          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                            {(()=>{const pts=(LS.get("__shared__"+POINTS_KEY)||{})[stu.sessionId];return pts?<span style={{fontSize:9,color:"#ffd700",background:"#ffd70015",padding:"2px 7px",borderRadius:99,fontWeight:700,border:"1px solid #ffd70030"}}>{pts.total||0} pts</span>:null;})()}
+                            <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>setResetTarget(stu.id)}>🔑 Reset pw</button>
+                            <button className="btn btn-ghost btn-sm" style={{fontSize:10,color:"#ff5370",borderColor:"#ff537044"}} onClick={e=>{e.stopPropagation();deleteStudent(stu.id,null);}}>🗑 Delete</button>
                           </div>
                         )}
                       </div>
@@ -4163,7 +4298,9 @@ function App() {
                   })
                 }
               </div>
-              <div className="mftr" style={{fontSize:10,color:"#3d5a73"}}>{studs.length} student{studs.length!==1?"s":""} registered</div>
+              <div className="mftr" style={{fontSize:10,color:"#3d5a73"}}>
+                {visibleStuds.length} of {studs.length} student{studs.length!==1?"s":""}
+              </div>
             </div>
           </div>
         );
@@ -4256,7 +4393,7 @@ function App() {
       {notif&&<div className="notif"><span style={{fontSize:14}}>{notif.icon}</span>{notif.msg}</div>}
 
       {/* Loading screen */}
-      {!loading&&loginScreen&&(
+      {loginScreen&&(
         <LoginScreen
           classes={classes}
           onLoginTeacher={loginTeacher}
