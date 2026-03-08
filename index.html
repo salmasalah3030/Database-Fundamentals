@@ -104,6 +104,8 @@ const store = {
 const DB_PFX        = "mysqlide:db:";
 const SHARED_DB_KEY = "mysqlide:shared-db";  // teacher's tables shared with all students
 const SESSIONS_KEY  = "mysqlide:sessions";
+const STUDENTS_KEY  = "mysqlide:students";   // shared: [{id,name,passHash,classId,color,created}]
+const TEACHER_KEY   = "mysqlide:teacher";    // shared: {passHash} — set on first teacher login
 const CURRENT_KEY   = "mysqlide:current";
 const MARATHON_KEY  = "mysqlide:marathon";
 const M_PROG_PFX    = "mysqlide:mprog:";
@@ -764,6 +766,12 @@ async function loadDB(sid, S) {
 
 
 const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+function simpleHash(str) {
+  // djb2 — good enough for a classroom tool
+  let h = 5381;
+  for(let i=0;i<str.length;i++) h=((h<<5)+h)^str.charCodeAt(i);
+  return (h>>>0).toString(36);
+}
 const pct = (a,b) => b>0?Math.round((a/b)*100):0;
 const gradeColor = p => p>=80?T.green:p>=60?T.orange:T.red;
 const gradeLabel = p => p>=90?"A":p>=80?"B":p>=70?"C":p>=60?"D":"F";
@@ -2621,13 +2629,140 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
   );
 }
 
+// ─── Login Screen ─────────────────────────────────────────────────────────────
+function LoginScreen({classes, onLoginTeacher, onLoginStudent, onRegisterStudent}) {
+  const [tab,setTab]=useState("student"); // "student" | "teacher" | "register"
+  const [name,setName]=useState("");
+  const [pass,setPass]=useState("");
+  const [pass2,setPass2]=useState("");
+  const [classId,setClassId]=useState("");
+  const [color,setColor]=useState("#4fc3f7");
+  const [err,setErr]=useState("");
+  const [busy,setBusy]=useState(false);
+  const COLORS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4"];
+
+  async function handleSubmit(){
+    setErr(""); setBusy(true);
+    try {
+      if(tab==="teacher"){
+        if(!pass.trim()){setErr("Enter your password");return;}
+        const ok=await onLoginTeacher(pass);
+        if(!ok) setErr("Wrong password");
+      } else if(tab==="student"){
+        if(!name.trim()||!pass.trim()){setErr("Fill in all fields");return;}
+        const res=await onLoginStudent(name.trim(),pass,classId);
+        if(res==="notfound") setErr("No account found with that name");
+        else if(res==="badpass") setErr("Incorrect password");
+      } else {
+        if(!name.trim()||!pass.trim()||!pass2.trim()||!classId){setErr("Fill in all fields");return;}
+        if(pass!==pass2){setErr("Passwords don't match");return;}
+        if(pass.length<3){setErr("Password must be at least 3 characters");return;}
+        const res=await onRegisterStudent(name.trim(),pass,classId,color);
+        if(res==="exists") setErr("That name is already taken");
+      }
+    } finally { setBusy(false); }
+  }
+
+  const inputStyle={width:"100%",padding:"10px 13px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:8,color:"#d6e4f0",fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box",transition:"border .15s"};
+  const focusInput=e=>{e.target.style.borderColor="#4fc3f7";};
+  const blurInput=e=>{e.target.style.borderColor="#1e2d3d";};
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"#0a1628",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",zIndex:300}}>
+      <div style={{width:"100%",maxWidth:420,padding:"0 20px"}}>
+        {/* Logo */}
+        <div style={{textAlign:"center",marginBottom:36}}>
+          <div style={{fontSize:52,marginBottom:6}}>⚡</div>
+          <div style={{fontSize:26,fontWeight:900,color:"#d6e4f0",letterSpacing:-0.5}}>QueryClass</div>
+          <div style={{fontSize:12,color:"#3d5a73",marginTop:3}}>SQL Learning Platform</div>
+        </div>
+
+        {/* Card */}
+        <div style={{background:"#0f1e2f",border:"1px solid #1e2d3d",borderRadius:16,overflow:"hidden",boxShadow:"0 24px 60px rgba(0,0,0,.5)"}}>
+          {/* Tabs */}
+          <div style={{display:"flex",borderBottom:"1px solid #1e2d3d"}}>
+            {[["student","👨‍💻 Student"],["register","✨ Register"],["teacher","👨‍🏫 Teacher"]].map(([t,l])=>(
+              <div key={t} onClick={()=>{setTab(t);setErr("");}} style={{flex:1,padding:"13px 0",textAlign:"center",fontSize:11,fontWeight:700,cursor:"pointer",color:tab===t?"#4fc3f7":"#3d5a73",borderBottom:tab===t?"2px solid #4fc3f7":"2px solid transparent",transition:"all .15s",userSelect:"none"}}>
+                {l}
+              </div>
+            ))}
+          </div>
+
+          <div style={{padding:"28px 28px 24px"}}>
+            {tab==="teacher"&&(
+              <div style={{fontSize:11,color:"#3d5a73",textAlign:"center",marginBottom:20,lineHeight:1.6}}>
+                First time? Set your password below.<br/>It will be saved for future logins.
+              </div>
+            )}
+
+            {tab!=="teacher"&&(
+              <div style={{marginBottom:16}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Username</label>
+                <input value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSubmit()} onFocus={focusInput} onBlur={blurInput} placeholder="e.g. Alice Johnson" style={inputStyle} autoFocus/>
+              </div>
+            )}
+
+            <div style={{marginBottom:tab==="register"?16:20}}>
+              <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Password</label>
+              <input type="password" value={pass} onChange={e=>setPass(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSubmit()} onFocus={focusInput} onBlur={blurInput} placeholder="••••••••" style={inputStyle}/>
+            </div>
+
+            {tab==="register"&&(
+              <div style={{marginBottom:16}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Confirm Password</label>
+                <input type="password" value={pass2} onChange={e=>setPass2(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleSubmit()} onFocus={focusInput} onBlur={blurInput} placeholder="••••••••" style={inputStyle}/>
+              </div>
+            )}
+
+            {(tab==="student"||tab==="register")&&(
+              <div style={{marginBottom:tab==="register"?16:20}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Class</label>
+                {classes.length===0
+                  ?<div style={{fontSize:11,color:"#ff5370",padding:"8px 0"}}>No classes yet — ask your teacher to create one first</div>
+                  :<div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    {classes.map(c=>(
+                      <div key={c.id} onClick={()=>setClassId(c.id)} style={{padding:"6px 14px",borderRadius:99,border:`2px solid ${classId===c.id?c.color:"#1e2d3d"}`,background:classId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:classId===c.id?c.color:"#3d5a73",transition:"all .15s",display:"flex",alignItems:"center",gap:5}}>
+                        <span style={{width:7,height:7,borderRadius:"50%",background:c.color,display:"inline-block"}}/>
+                        {c.name}
+                      </div>
+                    ))}
+                  </div>
+                }
+              </div>
+            )}
+
+            {tab==="register"&&(
+              <div style={{marginBottom:20}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Colour</label>
+                <div style={{display:"flex",gap:8}}>
+                  {COLORS.map(c=>(
+                    <div key={c} onClick={()=>setColor(c)} style={{width:22,height:22,borderRadius:"50%",background:c,cursor:"pointer",border:color===c?"3px solid white":"3px solid transparent",boxShadow:color===c?`0 0 0 2px ${c}`:"none",transition:"all .15s"}}/>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {err&&<div style={{fontSize:11,color:"#ff5370",background:"#ff537011",border:"1px solid #ff537033",borderRadius:6,padding:"8px 12px",marginBottom:14,textAlign:"center"}}>{err}</div>}
+
+            <button onClick={handleSubmit} disabled={busy} style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:"#4fc3f7",color:"#0a1628",fontSize:13,fontWeight:800,cursor:busy?"wait":"pointer",fontFamily:"inherit",transition:"all .15s",opacity:busy?0.7:1}}>
+              {busy?"…":tab==="teacher"?"Sign In as Teacher":tab==="register"?"Create Account":"Sign In"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 function App() {
   const [sqlJS,setSqlJS]=useState(null);
   const [loading,setLoading]=useState(true);
+  const [loginScreen,setLoginScreen]=useState(false); // show login before curSess is set
   const [view,setView]=useState("ide");
   const [sessions,setSessions]=useState([]);
   const [curSess,setCurSess]=useState(null);
+  const [students,setStudents]=useState([]); // shared student registry
   const [db,setDb]=useState(null);
   const dbRef=useRef(null);
   const [query,setQuery]=useState("-- Welcome to QueryClass!\n-- MySQL 8.0 syntax is fully supported.\n-- Press Ctrl+Enter to run.\n\nSHOW DATABASES;\nSELECT VERSION();\nSELECT USER();\n");
@@ -2679,11 +2814,16 @@ function App() {
     (async()=>{
       const S=await loadSQLJS(); setSqlJS(S);
       const sess=await store.get(SESSIONS_KEY)||[]; setSessions(sess);
+      const studs=LS.get("__shared__"+STUDENTS_KEY)||[]; setStudents(studs);
       const cid=await store.get(CURRENT_KEY);
-      if(cid){const f=sess.find(s=>s.id===cid);if(f)await activateSession(f,S);}
       const cls=await store.get(CLASSES_KEY,true)||[]; setClasses(cls);
-      await refreshMarathon(cid);
-      await refreshQuizData(cid);
+      if(cid){
+        const f=sess.find(s=>s.id===cid);
+        if(f){ await activateSession(f,S); await refreshMarathon(cid); await refreshQuizData(cid); }
+        else setLoginScreen(true);
+      } else {
+        setLoginScreen(true);
+      }
       setLoading(false);
     })();
     return()=>clearInterval(pollRef.current);
@@ -3411,7 +3551,6 @@ function App() {
   }
   async function createSession(){
     if(!newSess.name.trim()||!sqlJS) return;
-    // Enforce: only one teacher allowed
     if(newSess.role==="teacher" && sessions.some(s=>s.role==="teacher")){
       notify("A teacher session already exists","⚠️"); return;
     }
@@ -3419,6 +3558,101 @@ function App() {
     const upd=[...sessions,s]; setSessions(upd); await store.set(SESSIONS_KEY,upd);
     const database=new sqlJS.Database(); dbRef.current=database; setDb(database); setCurSess(s); setTables([]); setResults([]); setQReg(null); setMReg(null);
     await store.set(CURRENT_KEY,s.id); setNewSess({name:"",role:"student",color:"#4fc3f7",classId:null}); setModal(null); notify(`Session created: ${s.name}`);
+  }
+
+  // ── AUTH helpers ────────────────────────────────────────────────────────────
+  function saveStudents(arr){
+    LS.set("__shared__"+STUDENTS_KEY, arr);
+    setStudents(arr);
+  }
+
+  async function loginTeacher(password){
+    const rec = LS.get("__shared__"+TEACHER_KEY);
+    if(!rec){
+      // First-time setup: create teacher account + session
+      LS.set("__shared__"+TEACHER_KEY, {passHash:simpleHash(password)});
+      const allSess = LS.get(SESSIONS_KEY)||[];
+      let ts = allSess.find(s=>s.role==="teacher");
+      if(!ts){
+        ts={id:uid(),name:"Teacher",role:"teacher",color:"#c792ea",classId:null,created:new Date().toISOString()};
+        const upd=[...allSess,ts]; LS.set(SESSIONS_KEY,upd); setSessions(upd);
+      }
+      await activateSession(ts,sqlJS);
+      await refreshMarathon(ts.id); await refreshQuizData(ts.id);
+      setLoginScreen(false); notify("Welcome, Teacher! 👨‍🏫");
+      return true;
+    }
+    if(rec.passHash !== simpleHash(password)) return false;
+    const allSess = LS.get(SESSIONS_KEY)||[];
+    let ts = allSess.find(s=>s.role==="teacher");
+    if(!ts){
+      ts={id:uid(),name:"Teacher",role:"teacher",color:"#c792ea",classId:null,created:new Date().toISOString()};
+      const upd=[...allSess,ts]; LS.set(SESSIONS_KEY,upd); setSessions(upd);
+    }
+    await activateSession(ts,sqlJS);
+    await refreshMarathon(ts.id); await refreshQuizData(ts.id);
+    setLoginScreen(false); notify("Welcome back, Teacher! 👨‍🏫");
+    return true;
+  }
+
+  async function loginStudent(name, password, classId){
+    const studs = LS.get("__shared__"+STUDENTS_KEY)||[];
+    const rec = studs.find(s=>s.name.toLowerCase()===name.toLowerCase());
+    if(!rec) return "notfound";
+    if(rec.passHash !== simpleHash(password)) return "badpass";
+    // Find or create their session
+    const allSess = LS.get(SESSIONS_KEY)||[];
+    let sess = allSess.find(s=>s.id===rec.sessionId);
+    if(!sess){
+      sess={id:rec.sessionId||uid(),name:rec.name,role:"student",color:rec.color,classId:rec.classId,created:rec.created||new Date().toISOString()};
+      const upd=[...allSess.filter(s=>s.id!==sess.id),sess]; LS.set(SESSIONS_KEY,upd); setSessions(upd);
+    }
+    await activateSession(sess,sqlJS);
+    await refreshMarathon(sess.id); await refreshQuizData(sess.id);
+    setLoginScreen(false); notify("Welcome, "+rec.name+"! 👨‍💻");
+    return "ok";
+  }
+
+  async function registerStudent(name, password, classId, color){
+    const studs = LS.get("__shared__"+STUDENTS_KEY)||[];
+    if(studs.some(s=>s.name.toLowerCase()===name.toLowerCase())) return "exists";
+    const sessId = uid();
+    const rec={id:uid(),sessionId:sessId,name:name.trim(),passHash:simpleHash(password),classId,color,created:new Date().toISOString()};
+    const newStuds=[...studs,rec]; saveStudents(newStuds);
+    // Create session
+    const sess={id:sessId,name:rec.name,role:"student",color,classId,created:rec.created};
+    const allSess=LS.get(SESSIONS_KEY)||[];
+    const upd=[...allSess,sess]; LS.set(SESSIONS_KEY,upd); setSessions(upd);
+    await activateSession(sess,sqlJS);
+    await refreshMarathon(sess.id); await refreshQuizData(sess.id);
+    setLoginScreen(false); notify("Account created! Welcome, "+rec.name+" 🎉");
+    return "ok";
+  }
+
+  function logout(){
+    store.set(CURRENT_KEY, null);
+    setCurSess(null); setDb(null); dbRef.current=null;
+    setTables([]); setResults([]); setQReg(null); setMReg(null);
+    setLoginScreen(true);
+  }
+
+  function deleteStudent(sid, e){
+    e.stopPropagation();
+    if(!confirm("Delete student account? This also removes their session and database.")) return;
+    const studs=LS.get("__shared__"+STUDENTS_KEY)||[];
+    const rec=studs.find(s=>s.id===sid); if(!rec) return;
+    saveStudents(studs.filter(s=>s.id!==sid));
+    // Remove session
+    const allSess=LS.get(SESSIONS_KEY)||[];
+    const upd=allSess.filter(s=>s.id!==rec.sessionId); LS.set(SESSIONS_KEY,upd); setSessions(upd);
+    LS.del(DB_PFX+rec.sessionId);
+    notify("Student deleted");
+  }
+
+  function resetStudentPassword(sid, newPass){
+    const studs=LS.get("__shared__"+STUDENTS_KEY)||[];
+    const upd=studs.map(s=>s.id===sid?{...s,passHash:simpleHash(newPass)}:s);
+    saveStudents(upd); notify("Password reset ✓");
   }
   async function deleteSession(id,e){
     e.stopPropagation();
@@ -3450,7 +3684,7 @@ function App() {
   return (
     <>
       <style>{GCSS}</style>
-      <div className="app">
+      <div className="app" style={{visibility:loginScreen?"hidden":"visible"}}>
         {/* Header */}
         <header className="hdr">
           <div className="logo">
@@ -3469,12 +3703,13 @@ function App() {
             ))}
           </div>
           <div className="hdr-sep"/>
-          {curSess&&<div style={{fontSize:10,color:T.muted,flexShrink:0}}><strong style={{color:T.text}}>{curSess.name}</strong><span className={`tag ${curSess.role==="teacher"?"tag-t":"tag-s"}`}>{curSess.role}</span></div>}
-          <div className="sess-pill" onClick={()=>setModal("sessions")}>
-            <div className="dot" style={{background:curSess?T.green:T.muted,boxShadow:curSess?`0 0 7px ${T.green}`:"none"}}/>
-            {curSess?curSess.name:"No Session"}
-          </div>
-          <button className="btn btn-ghost btn-sm" onClick={()=>setModal("sessions")}>Sessions</button>
+          {curSess&&<div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+            <div className="dot" style={{background:T.green,boxShadow:`0 0 7px ${T.green}`}}/>
+            <div style={{fontSize:11,color:T.text,fontWeight:700}}>{curSess.name}</div>
+            <span className={`tag ${curSess.role==="teacher"?"tag-t":"tag-s"}`}>{curSess.role}</span>
+            {isTeacher&&<button className="btn btn-ghost btn-sm" onClick={()=>{setStudents(LS.get("__shared__"+STUDENTS_KEY)||[]);setModal("students");}}>👥 Students</button>}
+            <button className="btn btn-ghost btn-sm" onClick={logout} style={{color:"#ff5370",borderColor:"#ff537044"}}>Sign Out</button>
+          </div>}
         </header>
 
         {/* ── IDE ── */}
@@ -3888,6 +4123,52 @@ function App() {
         );
       })()}
 
+      {modal==="students"&&(()=>{
+        const studs=students;
+        const [resetTarget,setResetTarget]=useState(null);
+        const [newPass,setNewPass]=useState("");
+        return (
+          <div className="overlay" onClick={()=>setModal(null)}>
+            <div className="modal modal-lg" onClick={e=>e.stopPropagation()} style={{maxWidth:560}}>
+              <div className="mhdr"><span>👥 Student Accounts</span><button className="xbtn" onClick={()=>setModal(null)}>✕</button></div>
+              <div className="mbody" style={{maxHeight:"65vh"}}>
+                {studs.length===0
+                  ?<div className="empty"><div className="empty-ico">👥</div><div>No students yet — they register on the login page</div></div>
+                  :studs.map(stu=>{
+                    const cls=classes.find(c=>c.id===stu.classId);
+                    return (
+                      <div key={stu.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 12px",borderRadius:8,background:"#0d1b2a",border:"1px solid #1e2d3d",marginBottom:8}}>
+                        <div style={{width:34,height:34,borderRadius:"50%",background:stu.color+"33",border:`2px solid ${stu.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>👨‍💻</div>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:13,fontWeight:700,color:"#d6e4f0"}}>{stu.name}</div>
+                          <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}>
+                            {cls&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:99,background:cls.color+"22",color:cls.color,fontWeight:700,border:`1px solid ${cls.color}44`}}>{cls.name}</span>}
+                            <span style={{fontSize:9,color:"#3d5a73"}}>{new Date(stu.created).toLocaleDateString()}</span>
+                          </div>
+                        </div>
+                        {resetTarget===stu.id?(
+                          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                            <input placeholder="New password" value={newPass} onChange={e=>setNewPass(e.target.value)} style={{padding:"5px 8px",background:"#0a1628",border:"1px solid #1e2d3d",borderRadius:5,color:"#d6e4f0",fontSize:11,width:120}}/>
+                            <button className="btn btn-green btn-sm" onClick={()=>{if(newPass.length>=3){resetStudentPassword(stu.id,newPass);setResetTarget(null);setNewPass("");}}} style={{padding:"5px 10px"}}>Save</button>
+                            <button className="btn btn-ghost btn-sm" onClick={()=>{setResetTarget(null);setNewPass("");}} style={{padding:"5px 10px"}}>✕</button>
+                          </div>
+                        ):(
+                          <div style={{display:"flex",gap:6}}>
+                            <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>setResetTarget(stu.id)}>🔑 Reset</button>
+                            <button className="xbtn" onClick={e=>deleteStudent(stu.id,e)}>🗑</button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
+                }
+              </div>
+              <div className="mftr" style={{fontSize:10,color:"#3d5a73"}}>{studs.length} student{studs.length!==1?"s":""} registered</div>
+            </div>
+          </div>
+        );
+      })()}
+
       {modal==="new-session"&&(
         <div className="overlay" onClick={()=>setModal("sessions")}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
@@ -3975,6 +4256,15 @@ function App() {
       {notif&&<div className="notif"><span style={{fontSize:14}}>{notif.icon}</span>{notif.msg}</div>}
 
       {/* Loading screen */}
+      {!loading&&loginScreen&&(
+        <LoginScreen
+          classes={classes}
+          onLoginTeacher={loginTeacher}
+          onLoginStudent={loginStudent}
+          onRegisterStudent={registerStudent}
+        />
+      )}
+
       {loading&&(
         <div style={{position:"fixed",inset:0,background:T.bg,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:16,zIndex:200}}>
           <div style={{fontSize:42}}>⚡</div>
