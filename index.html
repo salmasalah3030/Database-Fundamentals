@@ -102,6 +102,7 @@ const store = {
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 const DB_PFX        = "mysqlide:db:";
+const SHARED_DB_KEY = "mysqlide:shared-db";  // teacher's tables shared with all students
 const SESSIONS_KEY  = "mysqlide:sessions";
 const CURRENT_KEY   = "mysqlide:current";
 const MARATHON_KEY  = "mysqlide:marathon";
@@ -725,6 +726,37 @@ async function loadSQLJS() {
   });
 }
 async function saveDB(sid, db) { try { const b64 = btoa(String.fromCharCode(...db.export())); LS.set(DB_PFX+sid, b64); } catch {} }
+// Save teacher schema to shared key so students can load it
+function saveSharedDB(db) {
+  try { const b64 = btoa(String.fromCharCode(...db.export())); LS.set("__shared__"+SHARED_DB_KEY, b64); } catch {}
+}
+// Merge teacher's tables into a student DB (copy CREATE TABLE + data)
+function mergeSharedTables(studentDb, sqlJS) {
+  try {
+    var b64 = LS.get("__shared__"+SHARED_DB_KEY);
+    if(!b64) return;
+    var teacherDb = new sqlJS.Database(Uint8Array.from(atob(b64), function(c){return c.charCodeAt(0);}));
+    var metaRes = teacherDb.exec("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name");
+    if(!metaRes.length){teacherDb.close();return;}
+    metaRes[0].values.forEach(function(row){
+      var tname = row[0]; var ddl = row[1];
+      if(!tname||!ddl) return;
+      try {
+        var safeDdl = ddl.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ");
+        safeDdl = safeDdl.replace("CREATE TABLE	", "CREATE TABLE IF NOT EXISTS ");
+        studentDb.run(safeDdl);
+        var dataRes = teacherDb.exec("SELECT * FROM ["+tname+"]");
+        if(!dataRes.length) return;
+        var cols = dataRes[0].columns;
+        var ph = cols.map(function(){return "?";}).join(",");
+        var colList = cols.map(function(c){return "["+c+"]";}).join(",");
+        var ins = "INSERT OR IGNORE INTO ["+tname+"] ("+colList+") VALUES ("+ph+")";
+        dataRes[0].values.forEach(function(r){ try{studentDb.run(ins,r);}catch(e2){} });
+      } catch(e){}
+    });
+    teacherDb.close();
+  } catch(e){}
+}
 async function loadDB(sid, S) {
   try { const v = LS.get(DB_PFX+sid); if (v) return new S.Database(Uint8Array.from(atob(v), c=>c.charCodeAt(0))); } catch {}
   return new S.Database();
@@ -3278,6 +3310,9 @@ function App() {
     await store.set(QSTUDENTS_KEY,upd,true); setQuizStudents(upd); setQReg(st); setQRegName(""); notify("Registered!");
   }
   async function loadQuiz(qid){
+    // Check lock status from meta (faster than full quiz load)
+    const meta=(quizList||[]).find(m=>m.id===qid);
+    if(meta?.locked && !isTeacher){ notify("🔒 This quiz is locked by the teacher","🔒"); return; }
     const q=await store.get(QUIZ_PFX+qid,true); setCurQuiz(q); setQAnswers({}); setSelQIdx(0);
   }
   async function submitQuiz(){
@@ -3344,6 +3379,16 @@ function App() {
     const upd=(await store.get(QUIZZES_KEY,true)||[]).filter(q=>q.id!==id);
     await store.set(QUIZZES_KEY,upd,true); setQuizList(upd); if(curQuiz?.id===id) setCurQuiz(null); notify("Quiz deleted");
   }
+  async function toggleQuizLock(id,e){
+    e.stopPropagation();
+    const list=await store.get(QUIZZES_KEY,true)||[];
+    const cur=list.find(q=>q.id===id); if(!cur) return;
+    const nowLocked=!cur.locked;
+    const upd=list.map(q=>q.id===id?{...q,locked:nowLocked}:q);
+    await store.set(QUIZZES_KEY,upd,true);
+    setQuizList(upd);
+    notify(nowLocked?"🔒 Quiz locked — students cannot open it":"🔓 Quiz unlocked");
+  }
 
   // Sessions
   async function activateSession(sess,S){
@@ -3351,7 +3396,10 @@ function App() {
     // Always re-read from storage so classId (and any other updates) are fresh
     const allSess = LS.get(SESSIONS_KEY)||[];
     const freshSess = allSess.find(s=>s.id===sess.id)||sess;
-    const database=await loadDB(freshSess.id,S); dbRef.current=database; setDb(database); setCurSess(freshSess); refreshTables(database);
+    const database=await loadDB(freshSess.id,S);
+    // Students: merge teacher's shared tables into their own DB
+    if(freshSess.role==="student") mergeSharedTables(database, S);
+    dbRef.current=database; setDb(database); setCurSess(freshSess); refreshTables(database);
     // Sync in-memory sessions list too
     setSessions(allSess);
     await store.set(CURRENT_KEY,freshSess.id);
@@ -3363,6 +3411,10 @@ function App() {
   }
   async function createSession(){
     if(!newSess.name.trim()||!sqlJS) return;
+    // Enforce: only one teacher allowed
+    if(newSess.role==="teacher" && sessions.some(s=>s.role==="teacher")){
+      notify("A teacher session already exists","⚠️"); return;
+    }
     const s={id:uid(),name:newSess.name.trim(),role:newSess.role,color:newSess.color,classId:newSess.classId||null,created:new Date().toISOString()};
     const upd=[...sessions,s]; setSessions(upd); await store.set(SESSIONS_KEY,upd);
     const database=new sqlJS.Database(); dbRef.current=database; setDb(database); setCurSess(s); setTables([]); setResults([]); setQReg(null); setMReg(null);
@@ -3380,6 +3432,8 @@ function App() {
     if(!db||!query.trim()) return;
     const t0=performance.now(); const res=execSQL(db,query); const ms=(performance.now()-t0).toFixed(1);
     setResults(res); refreshTables(db); saveDB(curSess.id,db);
+    // Teachers: also save schema to shared key so students get it
+    if(curSess?.role==="teacher") saveSharedDB(db);
     const err=res.some(r=>r.type==="error");
     setStatus({type:err?"err":"ok",msg:err?"Error":`${res.length} stmt · ${ms}ms`});
     setHistory(h=>[{sql:query.trim().slice(0,80),time:new Date().toLocaleTimeString()},...h.slice(0,49)]);
@@ -3427,11 +3481,46 @@ function App() {
         {view==="ide"&&(
           <div className="ide-grid">
             <div className="sidebar">
-              <div className="sb-hdr"><span>Tables</span><span style={{fontSize:9,color:T.dim}}>{tables.length}</span></div>
+              <div className="sb-hdr">
+                <span>{isTeacher?"Your Tables":"My Tables"}</span>
+                <span style={{fontSize:9,color:T.dim}}>{tables.length}</span>
+                {isTeacher&&<span title="Saved to shared DB" style={{fontSize:9,color:"#43d98c",marginLeft:4}}>⬆ shared</span>}
+              </div>
               <div className="sb-list">
                 {tables.length===0?<div style={{padding:"8px 7px",fontSize:10,color:T.dim}}>No tables yet</div>
                   :tables.map(t=><div key={t} className="sb-item" onClick={()=>setQuery(`DESCRIBE ${t};\nSELECT * FROM ${t} LIMIT 50;`)}>▦ {t}</div>)}
               </div>
+              {!isTeacher&&(()=>{
+                const sharedB64 = LS.get("__shared__"+SHARED_DB_KEY);
+                if(!sharedB64) return null;
+                let sharedTables = [];
+                try {
+                  if(sqlJS){
+                    const tdb = new sqlJS.Database(Uint8Array.from(atob(sharedB64),c=>c.charCodeAt(0)));
+                    const r = tdb.exec("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+                    if(r.length) sharedTables = r[0].values.map(v=>v[0]);
+                    tdb.close();
+                  }
+                } catch(e){}
+                if(sharedTables.length===0) return null;
+                return (
+                  <div>
+                    <div className="divider"/>
+                    <div className="sb-hdr" style={{color:"#43d98c"}}>
+                      <span>📋 Shared by Teacher</span>
+                      <span style={{fontSize:9,color:T.dim}}>{sharedTables.length}</span>
+                      <span title="Re-sync shared tables" style={{cursor:"pointer",marginLeft:4,fontSize:10}} onClick={()=>{if(db&&sqlJS){mergeSharedTables(db,sqlJS);refreshTables(db);}}}>↻</span>
+                    </div>
+                    <div className="sb-list">
+                      {sharedTables.map(t=>(
+                        <div key={t} className="sb-item" style={{color:"#43d98c"}} onClick={()=>setQuery(`DESCRIBE ${t};\nSELECT * FROM ${t} LIMIT 50;`)}>
+                          📋 {t}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
               <div className="divider"/>
               <div className="sb-hdr"><span>Quick Run</span></div>
               <div style={{padding:"0 5px 8px"}}>
@@ -3622,9 +3711,11 @@ function App() {
                                       <span style={{fontSize:9,fontWeight:600,color:cls.color}}>{cls.name}</span>
                                     </div>}
                                   </div>
-                                  <div style={{display:"flex",gap:4,flexShrink:0}}>
+                                  <div style={{display:"flex",gap:4,flexShrink:0,alignItems:"center"}}>
+                                    {q.locked&&<span style={{fontSize:9,color:"#ff5370",background:"#ff537022",padding:"1px 5px",borderRadius:99,fontWeight:700,flexShrink:0}}>🔒 Locked</span>}
                                     <button className="xbtn" title="Export Excel" onClick={e=>{e.stopPropagation();exportQuizExcel(q.id);}}>📊</button>
                                     <button className="xbtn" title="Edit" onClick={e=>{e.stopPropagation();store.get(QUIZ_PFX+q.id,true).then(qd=>{setNewQuiz({...qd,classId:qd.classId||q.classId});setModal("create-quiz");});}}>✏</button>
+                                    <button className="xbtn" title={q.locked?"Unlock quiz":"Lock quiz"} onClick={e=>toggleQuizLock(q.id,e)} style={{color:q.locked?"#43d98c":"#ff5370"}}>{q.locked?"🔓":"🔒"}</button>
                                     <button className="xbtn" title="Delete" onClick={e=>deleteQuiz(q.id,e)}>🗑</button>
                                   </div>
                                 </div>
@@ -3714,15 +3805,16 @@ function App() {
                         </span>}
                       </div>
                       <div className="sb-list">
-                        {myQuizzes.map(q=>{const sub=quizSubs[qReg.id]?.[q.id];const ti=timerInfo(q.id);return(
-                          <div key={q.id} style={{flexDirection:"column",alignItems:"flex-start",gap:2,padding:"9px 10px",borderRadius:7,border:`1px solid ${curQuiz?.id===q.id?T.borderHi:"transparent"}`,marginBottom:4,background:curQuiz?.id===q.id?T.accentGlow:"transparent",cursor:"pointer",userSelect:"none"}} onClick={()=>loadQuiz(q.id)}>
+                        {myQuizzes.map(q=>{const sub=quizSubs[qReg.id]?.[q.id];const ti=timerInfo(q.id);const isLocked=q.locked&&!sub;return(
+                          <div key={q.id} style={{flexDirection:"column",alignItems:"flex-start",gap:2,padding:"9px 10px",borderRadius:7,border:`1px solid ${curQuiz?.id===q.id?T.borderHi:isLocked?"#ff537033":"transparent"}`,marginBottom:4,background:curQuiz?.id===q.id?T.accentGlow:isLocked?"#1a0a0a":"transparent",cursor:isLocked?"not-allowed":"pointer",userSelect:"none",opacity:isLocked?0.6:1}} onClick={()=>loadQuiz(q.id)}>
                             <div style={{display:"flex",width:"100%",alignItems:"center",gap:5}}>
-                              <span style={{fontSize:12,fontWeight:600,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:T.text}}>{q.title}</span>
+                              <span style={{fontSize:12,fontWeight:600,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:isLocked?"#ff5370":T.text}}>{isLocked?"🔒 ":""}{q.title}</span>
                               {sub&&<span className={`badge ${sub.marked?"b-done":"b-pend"}`} style={{fontSize:8}}>{sub.marked?`${sub.totalScore}/${q.totalPts}`:"✓"}</span>}
                             </div>
                             <div style={{fontSize:9,color:T.muted}}>{q.qCount}Q · {q.totalPts}pts</div>
-                            {ti&&!ti.expired&&<div style={{fontSize:9,fontFamily:"'JetBrains Mono',monospace",color:ti.urgent?"#ff5370":ti.warn?"#ffb347":"#43d98c",marginTop:2}}>⏱ {ti.label}</div>}
-                            {ti?.expired&&!sub&&<div style={{fontSize:9,color:"#ff5370",marginTop:2}}>🔒 Closed</div>}
+                            {isLocked&&<div style={{fontSize:9,color:"#ff5370",marginTop:2}}>Locked by teacher</div>}
+                            {!isLocked&&ti&&!ti.expired&&<div style={{fontSize:9,fontFamily:"'JetBrains Mono',monospace",color:ti.urgent?"#ff5370":ti.warn?"#ffb347":"#43d98c",marginTop:2}}>⏱ {ti.label}</div>}
+                            {!isLocked&&ti?.expired&&!sub&&<div style={{fontSize:9,color:"#ff5370",marginTop:2}}>⏱ Closed</div>}
                           </div>
                         );})}
                         {myQuizzes.length===0&&<div style={{padding:"10px 8px",fontSize:10,color:T.dim}}>No quizzes yet</div>}
@@ -3751,25 +3843,50 @@ function App() {
       </div>
 
       {/* ── MODALS ── */}
-      {modal==="sessions"&&(
+      {modal==="sessions"&&(()=>{
+        // Students only see their own session (and can create a new one if none exists).
+        // Teachers see all sessions.
+        const teacherExists = sessions.some(s=>s.role==="teacher");
+        const visibleSessions = curSess?.role==="teacher"
+          ? sessions  // teacher sees all
+          : curSess   // student: only their own
+            ? sessions.filter(s=>s.id===curSess.id)
+            : sessions.filter(s=>s.role!=="teacher"); // pre-login: show only student sessions (no peeking at teacher)
+        return (
         <div className="overlay" onClick={()=>setModal(null)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <div className="mhdr"><span>🎓 Sessions</span><button className="xbtn" onClick={()=>setModal(null)}>✕</button></div>
             <div className="mbody">
               <button className="btn btn-run btn-sm" style={{marginBottom:12,width:"100%",justifyContent:"center"}} onClick={()=>setModal("new-session")}>+ New Session</button>
-              {sessions.length===0?<div className="empty"><div className="empty-ico">🎓</div><div>No sessions yet — create one to start</div></div>
-                :sessions.map(s=>(
-                  <div key={s.id} className={`sc ${curSess?.id===s.id?"sc-active":""}`} onClick={()=>{activateSession(s);setModal(null);}}>
+              {visibleSessions.length===0
+                ?<div className="empty"><div className="empty-ico">🎓</div><div>No session yet — create one to start</div></div>
+                :visibleSessions.map(s=>(
+                  <div key={s.id} className={`sc ${curSess?.id===s.id?"sc-active":""}`}
+                    onClick={()=>{
+                      // Students can only activate their own session
+                      if(curSess && curSess.role==="student" && s.id!==curSess.id) return;
+                      activateSession(s); setModal(null);
+                    }}>
                     <div className="sc-ico" style={{background:s.color+"25"}}>{s.role==="teacher"?"👨‍🏫":"👨‍💻"}</div>
-                    <div className="sc-info"><div className="sc-name">{s.name}<span className={`tag ${s.role==="teacher"?"tag-t":"tag-s"}`}>{s.role}</span>{s.classId&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:99,background:(classes.find(c=>c.id===s.classId)?.color||"#4fc3f7")+"22",color:classes.find(c=>c.id===s.classId)?.color||"#4fc3f7",fontWeight:700,marginLeft:4}}>{classes.find(c=>c.id===s.classId)?.name||"Class"}</span>}</div><div className="sc-meta">{new Date(s.created).toLocaleDateString()}</div></div>
+                    <div className="sc-info">
+                      <div className="sc-name">
+                        {s.name}
+                        <span className={`tag ${s.role==="teacher"?"tag-t":"tag-s"}`}>{s.role}</span>
+                        {s.classId&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:99,background:(classes.find(c=>c.id===s.classId)?.color||"#4fc3f7")+"22",color:classes.find(c=>c.id===s.classId)?.color||"#4fc3f7",fontWeight:700,marginLeft:4}}>{classes.find(c=>c.id===s.classId)?.name||"Class"}</span>}
+                      </div>
+                      <div className="sc-meta">{new Date(s.created).toLocaleDateString()}</div>
+                    </div>
                     {curSess?.id===s.id&&<span style={{fontSize:10,color:T.green}}>● Active</span>}
-                    <button className="xbtn" onClick={e=>deleteSession(s.id,e)}>🗑</button>
+                    {/* Students can only delete their own; teachers can delete any */}
+                    {(curSess?.role==="teacher"||s.id===curSess?.id)&&
+                      <button className="xbtn" onClick={e=>deleteSession(s.id,e)}>🗑</button>}
                   </div>
                 ))}
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {modal==="new-session"&&(
         <div className="overlay" onClick={()=>setModal("sessions")}>
@@ -3777,7 +3894,16 @@ function App() {
             <div className="mhdr"><span>New Session</span><button className="xbtn" onClick={()=>setModal("sessions")}>✕</button></div>
             <div className="mbody">
               <div className="fg"><label className="flabel">Your Name</label><input className="finput" autoFocus placeholder="e.g. Alice Johnson" value={newSess.name} onChange={e=>setNewSess(p=>({...p,name:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&createSession()}/><div className="fhint">Each session has its own isolated SQLite database</div></div>
-              <div className="fg"><label className="flabel">Role</label><div style={{display:"flex",gap:8}}>{["student","teacher"].map(r=><button key={r} className={`btn ${newSess.role===r?"btn-run":"btn-ghost"}`} onClick={()=>setNewSess(p=>({...p,role:r,classId:r==="teacher"?null:p.classId}))} style={{flex:1,justifyContent:"center"}}>{r==="teacher"?"👨‍🏫 Teacher":"👨‍💻 Student"}</button>)}</div></div>
+              <div className="fg">
+                <label className="flabel">Role</label>
+                <div style={{display:"flex",gap:8}}>
+                  <button className={`btn ${newSess.role==="student"?"btn-run":"btn-ghost"}`} onClick={()=>setNewSess(p=>({...p,role:"student"}))} style={{flex:1,justifyContent:"center"}}>👨‍💻 Student</button>
+                  {!sessions.some(s=>s.role==="teacher")
+                    ?<button className={`btn ${newSess.role==="teacher"?"btn-run":"btn-ghost"}`} onClick={()=>setNewSess(p=>({...p,role:"teacher",classId:null}))} style={{flex:1,justifyContent:"center"}}>👨‍🏫 Teacher</button>
+                    :<div style={{flex:1,padding:"6px 12px",borderRadius:6,background:"#1a2535",border:"1px solid #1e2d3d",fontSize:11,color:"#2d4a66",textAlign:"center",display:"flex",alignItems:"center",justifyContent:"center",gap:5}}>👨‍🏫 Teacher <span style={{fontSize:9,color:"#ff5370"}}>already exists</span></div>
+                  }
+                </div>
+              </div>
               {newSess.role==="student"&&(
                 <div className="fg">
                   <label className="flabel">Class</label>
