@@ -1753,12 +1753,12 @@ function RewardsView({curSess, isTeacher, quizStudents, classes}) {
     return ()=>clearInterval(pollRef.current);
   },[]);
 
-  // Set default class filter to teacher's first class or student's own class
+  // Set class filter strictly from session — never guess for students
   useEffect(()=>{
     if(!curSess) return;
     if(isTeacher && classes.length>0 && !selClassFilter) setSelClassFilter(classes[0].id);
-    if(!isTeacher && curSess.classId) setSelClassFilter(curSess.classId);
-  },[curSess, classes]);
+    if(!isTeacher) setSelClassFilter(curSess.classId||null);
+  },[curSess ? curSess.id : null, curSess ? curSess.classId : null, isTeacher]);
 
   async function load() {
     const pts = LS.get("__shared__"+POINTS_KEY)||{};
@@ -2122,7 +2122,7 @@ function StickerPicker({onPick, onClose}) {
   );
 }
 
-function Whiteboard({curSess, classes, isTeacher}) {
+function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
   const [selClassId, setSelClassId]  = useState(null);
   const [prompt, setPrompt]          = useState("");
   const [notes, setNotes]            = useState([]);
@@ -2134,17 +2134,16 @@ function Whiteboard({curSess, classes, isTeacher}) {
   const canvasRef = useRef(null);
   const dragRef   = useRef(null);
 
-  // Auto-select class from session for students; first class for teachers
+  // Auto-select class strictly from session classId — never fall back to first class
   useEffect(()=>{
     if(!curSess) return;
-    if(!isTeacher) {
-      // Student: use classId baked into their session
-      if(curSess.classId) setSelClassId(curSess.classId);
-      else if(classes.length>0) setSelClassId(classes[0].id); // fallback for old sessions
-    } else {
+    if(isTeacher) {
       if(classes.length>0 && !selClassId) setSelClassId(classes[0].id);
+    } else {
+      // Students: only use classId stored on session. No guessing.
+      setSelClassId(curSess.classId||null);
     }
-  },[classes, curSess]);
+  },[curSess ? curSess.id : null, curSess ? curSess.classId : null, isTeacher]);
 
   // Load & poll whiteboard data
   useEffect(()=>{
@@ -2368,12 +2367,41 @@ function Whiteboard({curSess, classes, isTeacher}) {
   // Group notes by author for live presence
   const authors = [...new Map(notes.map(n=>[n.authorId,{id:n.authorId,name:n.authorName,count:notes.filter(x=>x.authorId===n.authorId).length}])).values()];
 
+  // Save chosen class back onto the session so it persists everywhere
+  function assignClassToSession(classId) {
+    const allSess = LS.get(SESSIONS_KEY)||[];
+    const updated = allSess.map(s=>s.id===curSess.id ? {...s, classId} : s);
+    LS.set(SESSIONS_KEY, updated);
+    setSelClassId(classId);
+    if(onClassAssigned) onClassAssigned(classId);
+  }
+
   if(!curSess) return (
     <div className="wb-no-class"><div style={{fontSize:42}}>🪧</div><div style={{fontSize:16,fontWeight:700}}>Open a session to use the Whiteboard</div></div>
   );
 
   if(classes.length===0) return (
     <div className="wb-no-class"><div style={{fontSize:42}}>🏫</div><div style={{fontSize:16,fontWeight:700}}>No classes yet</div><div style={{fontSize:13,color:"#5a7a94"}}>A teacher must create a class before the whiteboard is available</div></div>
+  );
+
+  // Student has no class assigned — show a picker before letting them in
+  if(!isTeacher && !selClassId) return (
+    <div className="wb-no-class" style={{gap:20}}>
+      <div style={{fontSize:48}}>🏫</div>
+      <div style={{fontSize:17,fontWeight:800,color:"#d6e4f0"}}>Which class are you in?</div>
+      <div style={{fontSize:12,color:"#5a7a94",marginBottom:4}}>Your session wasn't linked to a class. Pick yours to continue.</div>
+      <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%",maxWidth:320}}>
+        {classes.map(c=>(
+          <div key={c.id} onClick={()=>assignClassToSession(c.id)}
+            style={{padding:"13px 20px",borderRadius:12,border:`2px solid ${c.color}`,background:c.color+"18",cursor:"pointer",display:"flex",alignItems:"center",gap:12,transition:"all .15s"}}
+            onMouseEnter={e=>e.currentTarget.style.background=c.color+"33"}
+            onMouseLeave={e=>e.currentTarget.style.background=c.color+"18"}>
+            <span style={{width:14,height:14,borderRadius:"50%",background:c.color,display:"inline-block",flexShrink:0}}/>
+            <span style={{fontSize:14,fontWeight:700,color:c.color}}>{c.name}</span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 
   return (
@@ -3320,10 +3348,15 @@ function App() {
   // Sessions
   async function activateSession(sess,S){
     S=S||sqlJS;
-    const database=await loadDB(sess.id,S); dbRef.current=database; setDb(database); setCurSess(sess); refreshTables(database);
-    await store.set(CURRENT_KEY,sess.id);
-    const qs=await store.get(QSTUDENTS_KEY,true)||[]; setQReg(qs.find(s=>s.sessionId===sess.id)||null);
-    const ms=await store.get(M_STUDENTS,true)||[]; setMReg(ms.find(s=>s.sessionId===sess.id)||null);
+    // Always re-read from storage so classId (and any other updates) are fresh
+    const allSess = LS.get(SESSIONS_KEY)||[];
+    const freshSess = allSess.find(s=>s.id===sess.id)||sess;
+    const database=await loadDB(freshSess.id,S); dbRef.current=database; setDb(database); setCurSess(freshSess); refreshTables(database);
+    // Sync in-memory sessions list too
+    setSessions(allSess);
+    await store.set(CURRENT_KEY,freshSess.id);
+    const qs=await store.get(QSTUDENTS_KEY,true)||[]; setQReg(qs.find(s=>s.sessionId===freshSess.id)||null);
+    const ms=await store.get(M_STUDENTS,true)||[]; setMReg(ms.find(s=>s.sessionId===freshSess.id)||null);
   }
   function refreshTables(database){
     try{const r=database.exec("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");setTables(r[0]?.values?.map(v=>v[0])||[]);}catch{setTables([]);}
@@ -3801,7 +3834,7 @@ function App() {
       {/* ── Whiteboard ── */}
       {view==="whiteboard"&&(
         <div style={{position:"absolute",inset:"52px 0 0 0",overflow:"hidden"}}>
-          <Whiteboard curSess={curSess} classes={classes} isTeacher={isTeacher}/>
+          <Whiteboard curSess={curSess} classes={classes} isTeacher={isTeacher} onClassAssigned={classId=>{const allSess=LS.get(SESSIONS_KEY)||[];const updated=allSess.map(s=>s.id===curSess.id?{...s,classId}:s);LS.set(SESSIONS_KEY,updated);setSessions(updated);setCurSess(p=>({...p,classId}));}}/>
         </div>
       )}
 
