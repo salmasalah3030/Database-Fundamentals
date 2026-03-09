@@ -86,18 +86,107 @@
 <script type="text/babel">
 const { useState, useEffect, useRef, useCallback } = React;
 
-// ─── Storage (localStorage-backed, shared via prefix) ─────────────────────────
-// "shared" data uses a global prefix so all sessions on same device can read it.
-// In a real deployment you'd swap this for a backend API.
+// ─── Storage ──────────────────────────────────────────────────────────────────
+// Local  (per-device) : localStorage  — sessions, current session ID, DB binaries
+// Shared (cross-device): window.storage — classes, students, quizzes, points, etc.
+//
+// sharedCache: in-memory mirror of all window.storage shared keys.
+// All synchronous LS.get/set("__shared__"...) calls go through this cache.
+// async store.get/set(k, true) hits window.storage AND updates the cache.
 const LS = {
   get: (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   del: (k) => { try { localStorage.removeItem(k); } catch {} },
 };
+
+// Sync shared cache — populated from window.storage at init, updated on every write
+const sharedCache = {};
+async function syncSharedFromStorage() {
+  try {
+    const result = await window.storage.list('', true);
+    const keys = result?.keys || [];
+    for (const k of keys) {
+      try {
+        const r = await window.storage.get(k, true);
+        if (r) {
+          try { sharedCache[k] = JSON.parse(r.value); } catch { sharedCache[k] = r.value; }
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+// LS shim that intercepts __shared__ reads/writes and routes through cache+window.storage
+const origLSget = LS.get.bind(LS);
+const origLSset = LS.set.bind(LS);
+const origLSdel = LS.del.bind(LS);
+// Override LS to intercept __shared__ keys
+const LSsh = {
+  get: (k) => {
+    if (k.startsWith('__shared__')) {
+      const sk = k.slice('__shared__'.length);
+      return sk in sharedCache ? sharedCache[sk] : null;
+    }
+    return origLSget(k);
+  },
+  set: (k, v) => {
+    if (k.startsWith('__shared__')) {
+      const sk = k.slice('__shared__'.length);
+      sharedCache[sk] = v;
+      // fire-and-forget write to window.storage
+      try { window.storage.set(sk, JSON.stringify(v), true).catch(()=>{}); } catch {}
+      return;
+    }
+    origLSset(k, v);
+  },
+  del: (k) => {
+    if (k.startsWith('__shared__')) {
+      const sk = k.slice('__shared__'.length);
+      delete sharedCache[sk];
+      try { window.storage.delete(sk, true).catch(()=>{}); } catch {}
+      return;
+    }
+    origLSdel(k);
+  },
+};
+// Patch LS methods to use the shim
+LS.get = LSsh.get;
+LS.set = LSsh.set;
+LS.del = LSsh.del;
+
 const store = {
-  get:  async (k, sh=false) => LS.get((sh?"__shared__":"")+k),
-  set:  async (k, v, sh=false) => LS.set((sh?"__shared__":"")+k, v),
-  del:  async (k, sh=false) => LS.del((sh?"__shared__":"")+k),
+  get: async (k, sh=false) => {
+    if (!sh) return origLSget(k);
+    // Always read from window.storage and refresh cache
+    try {
+      const r = await window.storage.get(k, true);
+      if (!r) { return sharedCache[k] ?? null; }
+      try { const v = JSON.parse(r.value); sharedCache[k]=v; return v; } catch { sharedCache[k]=r.value; return r.value; }
+    } catch { return sharedCache[k] ?? null; }
+  },
+  set: async (k, v, sh=false) => {
+    if (!sh) { origLSset(k, v); return; }
+    sharedCache[k] = v;
+    try { await window.storage.set(k, JSON.stringify(v), true); } catch {}
+  },
+  del: async (k, sh=false) => {
+    if (!sh) { origLSdel(k); return; }
+    delete sharedCache[k];
+    try { await window.storage.delete(k, true); } catch {}
+  },
+  list: async (prefix, sh=false) => {
+    if (!sh) {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k2 = localStorage.key(i);
+        if (k2 && k2.startsWith(prefix)) keys.push(k2);
+      }
+      return keys;
+    }
+    try { const r = await window.storage.list(prefix, true); return r?.keys || []; } catch {
+      return Object.keys(sharedCache).filter(k=>k.startsWith(prefix));
+    }
+  },
 };
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
@@ -3306,18 +3395,20 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
   const [classes,setClasses]=useState(initialClasses||[]);
   const COLORS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4"];
 
-  // Poll shared storage for classes every 2s so students see classes as soon as teacher creates them
+  // Poll window.storage for classes every 2s — works cross-device
   useEffect(()=>{
-    const refresh=()=>{
-      const cls=LS.get("__shared__"+CLASSES_KEY)||[];
-      setClasses(prev=>{
-        if(JSON.stringify(prev)===JSON.stringify(cls)) return prev;
-        return cls;
-      });
+    let cancelled=false;
+    const refresh=async()=>{
+      try {
+        const r=await window.storage.get(CLASSES_KEY,true);
+        if(cancelled) return;
+        const cls=r ? (()=>{try{return JSON.parse(r.value);}catch{return [];}})() : [];
+        setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
+      } catch {}
     };
-    refresh(); // immediate
+    refresh();
     const t=setInterval(refresh,2000);
-    return()=>clearInterval(t);
+    return()=>{cancelled=true;clearInterval(t);};
   },[]);
 
   // Auto-select first class if none selected yet
@@ -3402,7 +3493,7 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
               <div style={{marginBottom:tab==="register"?16:20}}>
                 <div style={{display:"flex",alignItems:"center",marginBottom:6}}>
                   <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",textTransform:"uppercase",letterSpacing:1,flex:1}}>Class</label>
-                  {classes.length===0&&<span style={{fontSize:9,color:"#3d5a73",cursor:"pointer",userSelect:"none"}} onClick={()=>{const cls=LS.get("__shared__"+CLASSES_KEY)||[];setClasses(cls);}}>↻ refresh</span>}
+                  {classes.length===0&&<span style={{fontSize:9,color:"#3d5a73",cursor:"pointer",userSelect:"none"}} onClick={async()=>{try{const r=await window.storage.get(CLASSES_KEY,true);const cls=r?(()=>{try{return JSON.parse(r.value);}catch{return [];}})():[];setClasses(cls);}catch{}}}>↻ refresh</span>}
                 </div>
                 {classes.length===0
                   ?<div style={{fontSize:11,color:"#ff5370",padding:"8px 0"}}>No classes yet — ask your teacher to create one first</div>
@@ -3645,6 +3736,8 @@ function App() {
 
   useEffect(()=>{
     (async()=>{
+      // Sync ALL shared data from window.storage into sharedCache first
+      await syncSharedFromStorage();
       const S=await loadSQLJS(); setSqlJS(S);
       const sess=await store.get(SESSIONS_KEY)||[]; setSessions(sess);
       const studs=LS.get("__shared__"+STUDENTS_KEY)||[]; setStudents(studs);
@@ -3674,6 +3767,8 @@ function App() {
         if(view!=="ide"){ refreshMarathon(); refreshQuizData(); }
         const cls=await store.get(CLASSES_KEY,true)||[];
         setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
+        // Keep sharedCache fresh for sync LS.get("__shared__"...) calls
+        await syncSharedFromStorage();
         // Students: re-sync teacher's shared tables every 4s so they always have latest
         if(curSess?.role==="student" && db && sqlJS){
           mergeSharedTables(db, sqlJS);
