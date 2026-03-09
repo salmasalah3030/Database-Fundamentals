@@ -4024,7 +4024,7 @@ function App() {
         else setLoginScreen(true);
       } else {
         // No session — show connect screen first if Firebase not yet configured
-        if(!fbOk) setConnectScreen(true);
+        if(!fbOk) { setConnectScreen(true); setLoginScreen(false); }
         else setLoginScreen(true);
       }
       setLoading(false);
@@ -5058,7 +5058,7 @@ function App() {
   return (
     <>
       <style>{GCSS}</style>
-      <div className="app" style={{visibility:loginScreen?"hidden":"visible"}}>
+      <div className="app" style={{visibility:(loginScreen||connectScreen)?"hidden":"visible"}}>
         {/* Header */}
         <header className="hdr">
           <div className="logo">
@@ -5620,14 +5620,14 @@ function App() {
         );
       })()}
 
-      {connectScreen&&!loginScreen&&(
+      {connectScreen&&(
         <ConnectScreen
           onConnected={()=>{ setConnectScreen(false); setLoginScreen(true); setFbConnected(true); setFbRoomCode(_fbConfig?.roomCode||""); }}
           onSkip={()=>{ setConnectScreen(false); setLoginScreen(true); }}
         />
       )}
 
-      {loginScreen&&!connectScreen&&(
+      {loginScreen&&(
         <LoginScreen
           classes={classes}
           onLoginTeacher={loginTeacher}
