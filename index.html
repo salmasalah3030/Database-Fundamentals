@@ -87,107 +87,181 @@
 const { useState, useEffect, useRef, useCallback } = React;
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
-// Local  (per-device) : localStorage  — sessions, current session ID, DB binaries
-// Shared (cross-device): window.storage — classes, students, quizzes, points, etc.
+// Local  (per-device): localStorage — sessions, current session ID, DB binaries
+// Shared (cross-device): Firebase Realtime Database under /{roomCode}/
 //
-// sharedCache: in-memory mirror of all window.storage shared keys.
-// All synchronous LS.get/set("__shared__"...) calls go through this cache.
-// async store.get/set(k, true) hits window.storage AND updates the cache.
+// roomCode is set by teacher on first launch and shared with students.
+// All sh=true reads/writes go through Firebase; sh=false stays in localStorage.
+
 const LS = {
   get: (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } },
   set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   del: (k) => { try { localStorage.removeItem(k); } catch {} },
 };
 
-// Sync shared cache — populated from window.storage at init, updated on every write
-const sharedCache = {};
-async function syncSharedFromStorage() {
-  try {
-    const result = await window.storage.list('', true);
-    const keys = result?.keys || [];
-    for (const k of keys) {
-      try {
-        const r = await window.storage.get(k, true);
-        if (r) {
-          try { sharedCache[k] = JSON.parse(r.value); } catch { sharedCache[k] = r.value; }
-        }
-      } catch {}
-    }
-  } catch {}
+// ── Firebase helpers ─────────────────────────────────────────────────────────
+let _fbConfig = null;   // { apiKey, databaseURL, roomCode }
+let _fbReady = false;
+let _fbDB = null;       // firebase.database() instance
+const _fbListeners = {}; // key → { ref, callback }
+
+function fbPath(k) {
+  // Convert key to a safe Firebase path segment (no . # $ [ ])
+  const room = _fbConfig?.roomCode || "default";
+  return room + "/" + k.replace(/[.#$[\]]/g, "_");
 }
 
-// LS shim that intercepts __shared__ reads/writes and routes through cache+window.storage
-const origLSget = LS.get.bind(LS);
-const origLSset = LS.set.bind(LS);
-const origLSdel = LS.del.bind(LS);
-// Override LS to intercept __shared__ keys
-const LSsh = {
-  get: (k) => {
-    if (k.startsWith('__shared__')) {
-      const sk = k.slice('__shared__'.length);
-      return sk in sharedCache ? sharedCache[sk] : null;
-    }
-    return origLSget(k);
-  },
-  set: (k, v) => {
-    if (k.startsWith('__shared__')) {
-      const sk = k.slice('__shared__'.length);
-      sharedCache[sk] = v;
-      // fire-and-forget write to window.storage
-      try { window.storage.set(sk, JSON.stringify(v), true).catch(()=>{}); } catch {}
-      return;
-    }
-    origLSset(k, v);
-  },
-  del: (k) => {
-    if (k.startsWith('__shared__')) {
-      const sk = k.slice('__shared__'.length);
-      delete sharedCache[sk];
-      try { window.storage.delete(sk, true).catch(()=>{}); } catch {}
-      return;
-    }
-    origLSdel(k);
-  },
-};
-// Patch LS methods to use the shim
-LS.get = LSsh.get;
-LS.set = LSsh.set;
-LS.del = LSsh.del;
+async function fbGet(k) {
+  if (!_fbReady || !_fbDB) return null;
+  try {
+    const snap = await _fbDB.ref(fbPath(k)).once("value");
+    return snap.val();
+  } catch { return null; }
+}
 
+async function fbSet(k, v) {
+  if (!_fbReady || !_fbDB) return;
+  try { await _fbDB.ref(fbPath(k)).set(v); } catch {}
+}
+
+async function fbDel(k) {
+  if (!_fbReady || !_fbDB) return;
+  try { await _fbDB.ref(fbPath(k)).remove(); } catch {}
+}
+
+// Subscribe to real-time updates for a key; callback(value) fires on change
+function fbSubscribe(k, callback) {
+  if (!_fbReady || !_fbDB) return;
+  const path = fbPath(k);
+  if (_fbListeners[k]) {
+    try { _fbDB.ref(_fbListeners[k].path).off("value", _fbListeners[k].fn); } catch {}
+  }
+  const fn = snap => callback(snap.val());
+  _fbDB.ref(path).on("value", fn);
+  _fbListeners[k] = { path, fn };
+}
+
+function fbUnsubscribe(k) {
+  if (_fbListeners[k] && _fbDB) {
+    try { _fbDB.ref(_fbListeners[k].path).off("value", _fbListeners[k].fn); } catch {}
+    delete _fbListeners[k];
+  }
+}
+
+async function initFirebase(config) {
+  // config = { apiKey, databaseURL, roomCode }
+  if (!config?.apiKey || !config?.databaseURL) return false;
+  try {
+    if (typeof firebase === "undefined") {
+      await new Promise((res, rej) => {
+        const s1 = document.createElement("script");
+        s1.src = "https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js";
+        s1.onload = res; s1.onerror = rej;
+        document.head.appendChild(s1);
+      });
+      await new Promise((res, rej) => {
+        const s2 = document.createElement("script");
+        s2.src = "https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js";
+        s2.onload = res; s2.onerror = rej;
+        document.head.appendChild(s2);
+      });
+    }
+    if (!firebase.apps?.length) {
+      firebase.initializeApp({ apiKey: config.apiKey, databaseURL: config.databaseURL });
+    }
+    _fbDB = firebase.database();
+    _fbConfig = config;
+    _fbReady = true;
+    // Persist config locally so page reloads reconnect automatically
+    LS.set("qc:fbconfig", config);
+    return true;
+  } catch(e) {
+    console.error("Firebase init failed:", e);
+    return false;
+  }
+}
+
+// Try to restore saved Firebase config on page load
+async function tryRestoreFirebase() {
+  const saved = LS.get("qc:fbconfig");
+  if (saved?.apiKey && saved?.databaseURL) return initFirebase(saved);
+  return false;
+}
+
+// ── Unified async store ───────────────────────────────────────────────────────
+// sh=false → localStorage only
+// sh=true  → Firebase (falls back to localStorage cache if offline)
 const store = {
   get: async (k, sh=false) => {
-    if (!sh) return origLSget(k);
-    // Always read from window.storage and refresh cache
-    try {
-      const r = await window.storage.get(k, true);
-      if (!r) { return sharedCache[k] ?? null; }
-      try { const v = JSON.parse(r.value); sharedCache[k]=v; return v; } catch { sharedCache[k]=r.value; return r.value; }
-    } catch { return sharedCache[k] ?? null; }
+    if (!sh) return LS.get(k);
+    if (_fbReady) {
+      const v = await fbGet(k);
+      if (v !== null && v !== undefined) { LS.set("__cache__"+k, v); return v; }
+    }
+    return LS.get("__cache__"+k);  // offline fallback
   },
   set: async (k, v, sh=false) => {
-    if (!sh) { origLSset(k, v); return; }
-    sharedCache[k] = v;
-    try { await window.storage.set(k, JSON.stringify(v), true); } catch {}
+    if (!sh) { LS.set(k, v); return; }
+    LS.set("__cache__"+k, v);  // always update local cache
+    if (_fbReady) await fbSet(k, v);
   },
   del: async (k, sh=false) => {
-    if (!sh) { origLSdel(k); return; }
-    delete sharedCache[k];
-    try { await window.storage.delete(k, true); } catch {}
-  },
-  list: async (prefix, sh=false) => {
-    if (!sh) {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k2 = localStorage.key(i);
-        if (k2 && k2.startsWith(prefix)) keys.push(k2);
-      }
-      return keys;
-    }
-    try { const r = await window.storage.list(prefix, true); return r?.keys || []; } catch {
-      return Object.keys(sharedCache).filter(k=>k.startsWith(prefix));
-    }
+    if (!sh) { LS.del(k); return; }
+    LS.del("__cache__"+k);
+    if (_fbReady) await fbDel(k);
   },
 };
+
+// ── Sync LS.get/set("__shared__"...) calls through Firebase too ──────────────
+// Many internal functions call LS directly with "__shared__" prefix.
+// We keep a local cache (__cache__key) that store.set always updates,
+// and patch LS to read from cache for __shared__ keys.
+const _origLSget = LS.get.bind(LS);
+const _origLSset = LS.set.bind(LS);
+const _origLSdel = LS.del.bind(LS);
+LS.get = (k) => {
+  if (k.startsWith("__shared__")) {
+    const bare = k.slice("__shared__".length);
+    // Return from local cache (kept fresh by store.set + real-time subscriptions)
+    const cached = _origLSget("__cache__"+bare);
+    return cached;
+  }
+  return _origLSget(k);
+};
+LS.set = (k, v) => {
+  if (k.startsWith("__shared__")) {
+    const bare = k.slice("__shared__".length);
+    _origLSset("__cache__"+bare, v);
+    // Fire-and-forget to Firebase
+    if (_fbReady) fbSet(bare, v).catch(()=>{});
+    return;
+  }
+  _origLSset(k, v);
+};
+LS.del = (k) => {
+  if (k.startsWith("__shared__")) {
+    const bare = k.slice("__shared__".length);
+    _origLSdel("__cache__"+bare);
+    if (_fbReady) fbDel(bare).catch(()=>{});
+    return;
+  }
+  _origLSdel(k);
+};
+
+// Subscribe to all shared keys and keep local cache fresh in real-time
+const SHARED_SUBSCRIBE_KEYS = [
+  "mysqlide:classes","mysqlide:students","mysqlide:teacher",
+  "mysqlide:quizzes","mysqlide:qstudents","mysqlide:points","mysqlide:qrpts",
+  "mysqlide:marathon","mysqlide:mstudents","mysqlide:shared-db",
+];
+function subscribeSharedKeys() {
+  SHARED_SUBSCRIBE_KEYS.forEach(k => {
+    fbSubscribe(k, val => {
+      if (val !== null && val !== undefined) _origLSset("__cache__"+k, val);
+    });
+  });
+}
+
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 const DB_PFX        = "mysqlide:db:";
@@ -3383,8 +3457,72 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
 }
 
 // ─── Login Screen ─────────────────────────────────────────────────────────────
+// ─── Firebase Setup Modal ─────────────────────────────────────────────────────
+function FirebaseSetupModal({connected, roomCode, onConnect, onDisconnect, onClose}) {
+  const [apiKey,setApiKey]=useState(()=>LS.get("qc:fbconfig")?.apiKey||"");
+  const [dbURL,setDbURL]=useState(()=>LS.get("qc:fbconfig")?.databaseURL||"");
+  const [room,setRoom]=useState(()=>LS.get("qc:fbconfig")?.roomCode||roomCode||"");
+  const [err,setErr]=useState("");
+  const [busy,setBusy]=useState(false);
+  const inp={width:"100%",padding:"9px 12px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:8,color:"#d6e4f0",fontSize:12,fontFamily:"inherit",outline:"none",boxSizing:"border-box"};
+  async function connect(){
+    if(!apiKey.trim()||!dbURL.trim()||!room.trim()){setErr("Fill in all fields");return;}
+    if(!dbURL.includes("firebaseio.com")){setErr("Database URL must end with firebaseio.com");return;}
+    setBusy(true); setErr("");
+    const e=await onConnect({apiKey:apiKey.trim(),databaseURL:dbURL.trim(),roomCode:room.trim().toUpperCase()});
+    if(e) setErr(e);
+    setBusy(false);
+  }
+  return(
+    <div className="overlay" onClick={onClose}>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:500}}>
+        <div className="mhdr"><span>🔥 Firebase Setup</span><button className="xbtn" onClick={onClose}>✕</button></div>
+        <div className="mbody">
+          {connected
+            ?<div style={{textAlign:"center",padding:"12px 0"}}>
+                <div style={{fontSize:28,marginBottom:8}}>✅</div>
+                <div style={{fontSize:14,fontWeight:700,color:"#43d98c",marginBottom:4}}>Connected!</div>
+                <div style={{fontSize:12,color:"#5a7a94",marginBottom:4}}>Room Code: <strong style={{color:"#4fc3f7",fontSize:16,letterSpacing:2}}>{roomCode}</strong></div>
+                <div style={{fontSize:11,color:"#5a7a94",marginBottom:16}}>Share this code with your students when they register.</div>
+                <button className="btn btn-red btn-sm" onClick={onDisconnect}>Disconnect</button>
+              </div>
+            :<>
+              <div style={{background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:8,padding:"12px 14px",marginBottom:16,fontSize:11,color:"#5a7a94",lineHeight:1.7}}>
+                <strong style={{color:"#ffb347"}}>Setup steps:</strong><br/>
+                1. Go to <a href="https://console.firebase.google.com" target="_blank" style={{color:"#4fc3f7"}}>console.firebase.google.com</a><br/>
+                2. Create a project → Add a <strong>Realtime Database</strong> (start in test mode)<br/>
+                3. Go to Project Settings → copy your <strong>Web API Key</strong><br/>
+                4. Copy your <strong>Database URL</strong> (looks like https://xxx.firebaseio.com)<br/>
+                5. Choose a <strong>Room Code</strong> (e.g. MATH101) — share it with students
+              </div>
+              <div style={{marginBottom:12}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Web API Key</label>
+                <input style={inp} placeholder="AIzaSy..." value={apiKey} onChange={e=>setApiKey(e.target.value)}/>
+              </div>
+              <div style={{marginBottom:12}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Database URL</label>
+                <input style={inp} placeholder="https://your-project-default-rtdb.firebaseio.com" value={dbURL} onChange={e=>setDbURL(e.target.value)}/>
+              </div>
+              <div style={{marginBottom:4}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Room Code</label>
+                <input style={inp} placeholder="e.g. MATH101" value={room} onChange={e=>setRoom(e.target.value.toUpperCase())} maxLength={12}/>
+                <div style={{fontSize:10,color:"#3d5a73",marginTop:4}}>Students will enter this code to join your class.</div>
+              </div>
+              {err&&<div style={{fontSize:11,color:"#ff5370",background:"#ff537011",border:"1px solid #ff537033",borderRadius:6,padding:"8px 12px",marginTop:10}}>{err}</div>}
+            </>
+          }
+        </div>
+        {!connected&&<div className="mftr">
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          <button className="btn btn-purple btn-sm" onClick={connect} disabled={busy}>{busy?"Connecting…":"🔥 Connect"}</button>
+        </div>}
+      </div>
+    </div>
+  );
+}
+
 function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, onRegisterStudent}) {
-  const [tab,setTab]=useState("student"); // "student" | "teacher" | "register"
+  const [tab,setTab]=useState("student");
   const [name,setName]=useState("");
   const [pass,setPass]=useState("");
   const [pass2,setPass2]=useState("");
@@ -3393,28 +3531,42 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
   const [err,setErr]=useState("");
   const [busy,setBusy]=useState(false);
   const [classes,setClasses]=useState(initialClasses||[]);
+  const [roomCode,setRoomCode]=useState(()=>LS.get("qc:fbconfig")?.roomCode||"");
+  const [roomStatus,setRoomStatus]=useState(()=>_fbReady?"connected":"");
   const COLORS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4"];
 
-  // Poll window.storage for classes every 2s — works cross-device
+  // When Firebase is connected, poll for classes every 2s
   useEffect(()=>{
-    let cancelled=false;
-    const refresh=async()=>{
-      try {
-        const r=await window.storage.get(CLASSES_KEY,true);
-        if(cancelled) return;
-        const cls=r ? (()=>{try{return JSON.parse(r.value);}catch{return [];}})() : [];
-        setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
-      } catch {}
+    const refresh=()=>{
+      const cls=LS.get("__shared__"+CLASSES_KEY)||[];
+      setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
     };
     refresh();
     const t=setInterval(refresh,2000);
-    return()=>{cancelled=true;clearInterval(t);};
+    return()=>clearInterval(t);
   },[]);
 
-  // Auto-select first class if none selected yet
+  // Auto-select first class
   useEffect(()=>{
     if(classes.length>0 && !classId) setClassId(classes[0].id);
   },[classes]);
+
+  async function connectRoom(){
+    if(!roomCode.trim()){setRoomStatus("enter");return;}
+    const saved=LS.get("qc:fbconfig");
+    if(!saved?.apiKey){setRoomStatus("no-config");return;}
+    setRoomStatus("connecting");
+    const ok=await initFirebase({...saved,roomCode:roomCode.trim().toUpperCase()});
+    if(ok){
+      subscribeSharedKeys();
+      setRoomStatus("connected");
+      // Immediately fetch classes
+      const cls=await store.get(CLASSES_KEY,true)||[];
+      setClasses(cls);
+    } else {
+      setRoomStatus("failed");
+    }
+  }
 
   async function handleSubmit(){
     setErr(""); setBusy(true);
@@ -3490,13 +3642,28 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
             )}
 
             {(tab==="student"||tab==="register")&&(
+              <>
+              {/* Room Code */}
+              <div style={{marginBottom:14}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Room Code</label>
+                <div style={{display:"flex",gap:8}}>
+                  <input value={roomCode} onChange={e=>setRoomCode(e.target.value.toUpperCase())} onKeyDown={e=>e.key==="Enter"&&connectRoom()} placeholder="e.g. MATH101" style={{...inputStyle,flex:1,textTransform:"uppercase",letterSpacing:2,fontWeight:700}} maxLength={12}/>
+                  <button onClick={connectRoom} style={{padding:"10px 14px",borderRadius:8,border:"1px solid #1e2d3d",background:roomStatus==="connected"?"#43d98c22":"#4fc3f722",color:roomStatus==="connected"?"#43d98c":"#4fc3f7",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+                    {roomStatus==="connecting"?"…":roomStatus==="connected"?"✓ Joined":"Join"}
+                  </button>
+                </div>
+                {roomStatus==="failed"&&<div style={{fontSize:10,color:"#ff5370",marginTop:4}}>Could not connect — check the room code with your teacher</div>}
+                {roomStatus==="no-config"&&<div style={{fontSize:10,color:"#ffb347",marginTop:4}}>Your teacher hasn't set up the server yet</div>}
+                {roomStatus==="connected"&&<div style={{fontSize:10,color:"#43d98c",marginTop:4}}>Connected to room {roomCode}</div>}
+              </div>
               <div style={{marginBottom:tab==="register"?16:20}}>
                 <div style={{display:"flex",alignItems:"center",marginBottom:6}}>
                   <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",textTransform:"uppercase",letterSpacing:1,flex:1}}>Class</label>
-                  {classes.length===0&&<span style={{fontSize:9,color:"#3d5a73",cursor:"pointer",userSelect:"none"}} onClick={async()=>{try{const r=await window.storage.get(CLASSES_KEY,true);const cls=r?(()=>{try{return JSON.parse(r.value);}catch{return [];}})():[];setClasses(cls);}catch{}}}>↻ refresh</span>}
                 </div>
                 {classes.length===0
-                  ?<div style={{fontSize:11,color:"#ff5370",padding:"8px 0"}}>No classes yet — ask your teacher to create one first</div>
+                  ?<div style={{fontSize:11,color:"#5a7a94",padding:"8px 0"}}>
+                      {roomStatus==="connected"?"No classes created yet — ask your teacher":"Enter your room code above to see classes"}
+                    </div>
                   :<div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
                     {classes.map(c=>(
                       <div key={c.id} onClick={()=>setClassId(c.id)} style={{padding:"6px 14px",borderRadius:99,border:`2px solid ${classId===c.id?c.color:"#1e2d3d"}`,background:classId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:classId===c.id?c.color:"#3d5a73",transition:"all .15s",display:"flex",alignItems:"center",gap:5}}>
@@ -3507,6 +3674,7 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
                   </div>
                 }
               </div>
+              </>
             )}
 
             {tab==="register"&&(
@@ -3682,6 +3850,8 @@ function App() {
   const [sqlJS,setSqlJS]=useState(null);
   const [loading,setLoading]=useState(true);
   const [loginScreen,setLoginScreen]=useState(true); // true = show login as first screen
+  const [fbConnected,setFbConnected]=useState(false);
+  const [fbRoomCode,setFbRoomCode]=useState(()=>LS.get("qc:fbconfig")?.roomCode||"");
   const [view,setView]=useState("ide");
   const [sessions,setSessions]=useState([]);
   const [curSess,setCurSess]=useState(null);
@@ -3736,8 +3906,9 @@ function App() {
 
   useEffect(()=>{
     (async()=>{
-      // Sync ALL shared data from window.storage into sharedCache first
-      await syncSharedFromStorage();
+      // Restore Firebase connection from saved config
+      const fbOk = await tryRestoreFirebase();
+      if (fbOk) { subscribeSharedKeys(); setFbConnected(true); setFbRoomCode(_fbConfig?.roomCode||""); }
       const S=await loadSQLJS(); setSqlJS(S);
       const sess=await store.get(SESSIONS_KEY)||[]; setSessions(sess);
       const studs=LS.get("__shared__"+STUDENTS_KEY)||[]; setStudents(studs);
@@ -3767,8 +3938,7 @@ function App() {
         if(view!=="ide"){ refreshMarathon(); refreshQuizData(); }
         const cls=await store.get(CLASSES_KEY,true)||[];
         setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
-        // Keep sharedCache fresh for sync LS.get("__shared__"...) calls
-        await syncSharedFromStorage();
+
         // Students: re-sync teacher's shared tables every 4s so they always have latest
         if(curSess?.role==="student" && db && sqlJS){
           mergeSharedTables(db, sqlJS);
@@ -4817,6 +4987,7 @@ function App() {
             <div style={{fontSize:11,color:T.text,fontWeight:700}}>{curSess.name}</div>
             <span className={`tag ${curSess.role==="teacher"?"tag-t":"tag-s"}`}>{curSess.role}</span>
             {isTeacher&&<button className="btn btn-ghost btn-sm" onClick={()=>{setStudents(LS.get("__shared__"+STUDENTS_KEY)||[]);setModal("students");}}>👥 Students</button>}
+            {isTeacher&&<button className="btn btn-ghost btn-sm" onClick={()=>setModal("firebase-setup")} style={{borderColor:fbConnected?"#43d98c44":"#ffb34744",color:fbConnected?"#43d98c":"#ffb347"}}>{fbConnected?"🔥 "+fbRoomCode:"🔥 Connect"}</button>}
             <button className="btn btn-ghost btn-sm" onClick={logout} style={{color:"#ff5370",borderColor:"#ff537044"}}>Sign Out</button>
           </div>}
         </header>
@@ -5286,6 +5457,31 @@ function App() {
       {modal==="marking"&&markingQuiz&&<MarkingModal markingQuiz={markingQuiz} quizSubs={quizSubs} quizStudents={quizStudents} markScores={markScores} setMarkScores={setMarkScores} markFeedback={markFeedback} setMarkFeedback={setMarkFeedback} saveMarking={saveMarking} onClose={()=>setModal(null)}/>}
 
       {modal==="manage-classes"&&<ClassManagerModal classes={classes} onSave={saveClass} onDelete={deleteClass} onClose={()=>setModal(null)}/>}
+
+      {modal==="firebase-setup"&&<FirebaseSetupModal
+        connected={fbConnected}
+        roomCode={fbRoomCode}
+        onConnect={async(cfg)=>{
+          const ok=await initFirebase(cfg);
+          if(ok){
+            subscribeSharedKeys();
+            setFbConnected(true);
+            setFbRoomCode(cfg.roomCode);
+            notify("🔥 Firebase connected! Room: "+cfg.roomCode);
+            setModal(null);
+          } else {
+            return "Firebase connection failed — check your API key and database URL";
+          }
+        }}
+        onDisconnect={()=>{
+          LS.del("qc:fbconfig");
+          _fbReady=false; _fbDB=null; _fbConfig=null;
+          setFbConnected(false); setFbRoomCode("");
+          setModal(null);
+          notify("Firebase disconnected","⚠️");
+        }}
+        onClose={()=>setModal(null)}
+      />}
 
       {/* ── Whiteboard ── */}
       {view==="whiteboard"&&(
