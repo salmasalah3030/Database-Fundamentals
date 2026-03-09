@@ -3477,6 +3477,82 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
 }
 
 // ─── Login Screen ─────────────────────────────────────────────────────────────
+// ─── Connect Screen (first-time server setup) ────────────────────────────────
+function ConnectScreen({onConnected, onSkip}) {
+  const [serverCode,setServerCode]=useState("");
+  const [status,setStatus]=useState(""); // "connecting"|"failed"|"ok"
+  const [errMsg,setErrMsg]=useState("");
+  const inp={width:"100%",padding:"11px 14px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:8,color:"#d6e4f0",fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box",transition:"border .15s"};
+
+  async function connect(){
+    const code=serverCode.trim();
+    if(!code){setErrMsg("Paste the server code your teacher gave you");return;}
+    setStatus("connecting"); setErrMsg("");
+    try {
+      let dbURL=null, apiKey=null, finalRoom=code.toUpperCase();
+      if(code.includes("|")){
+        const parts=code.split("|");
+        finalRoom=parts[0].trim().toUpperCase();
+        dbURL=parts[1].trim();
+      } else {
+        const saved=LS.get("qc:fbconfig");
+        if(saved?.apiKey&&saved?.databaseURL){ dbURL=saved.databaseURL; apiKey=saved.apiKey; }
+      }
+      if(dbURL&&!apiKey){
+        const url=dbURL.replace(/\/$/,"")+"/"+finalRoom+"/_config.json";
+        const resp=await fetch(url);
+        if(!resp.ok) throw new Error("HTTP "+resp.status+" — check the code");
+        const cfg=await resp.json();
+        if(!cfg?.apiKey) throw new Error("No server config found — ask teacher to reconnect from their side");
+        apiKey=cfg.apiKey; dbURL=cfg.databaseURL||dbURL;
+      }
+      if(!apiKey||!dbURL){setStatus("failed");setErrMsg("Could not find server — check the code");return;}
+      const ok=await initFirebase({apiKey,databaseURL:dbURL,roomCode:finalRoom});
+      if(ok){ subscribeSharedKeys(); setStatus("ok"); setTimeout(()=>onConnected(),600); }
+      else { setStatus("failed"); setErrMsg("Connection failed — try again"); }
+    } catch(e){ setStatus("failed"); setErrMsg(e.message||"Connection failed"); }
+  }
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"#0a1628",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",zIndex:300}}>
+      <div style={{width:"100%",maxWidth:400,padding:"0 24px"}}>
+        <div style={{textAlign:"center",marginBottom:36}}>
+          <div style={{fontSize:52,marginBottom:6}}>⚡</div>
+          <div style={{fontSize:26,fontWeight:900,color:"#d6e4f0",letterSpacing:-0.5}}>QueryClass</div>
+          <div style={{fontSize:12,color:"#3d5a73",marginTop:3}}>SQL Learning Platform</div>
+        </div>
+        <div style={{background:"#0f1e2f",border:"1px solid #1e2d3d",borderRadius:16,padding:"28px",boxShadow:"0 24px 60px rgba(0,0,0,.5)"}}>
+          <div style={{fontSize:15,fontWeight:800,color:"#d6e4f0",marginBottom:6}}>Connect to your class</div>
+          <div style={{fontSize:12,color:"#5a7a94",marginBottom:20,lineHeight:1.6}}>
+            Paste the <strong style={{color:"#d6e4f0"}}>server code</strong> your teacher shared with you.
+          </div>
+          <div style={{marginBottom:16}}>
+            <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Server Code</label>
+            <input
+              value={serverCode}
+              onChange={e=>setServerCode(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&connect()}
+              placeholder="Paste code here…"
+              autoFocus
+              style={{...inp,fontFamily:"monospace",fontSize:12}}
+            />
+          </div>
+          {errMsg&&<div style={{fontSize:11,color:"#ff5370",background:"#ff537011",border:"1px solid #ff537033",borderRadius:6,padding:"8px 12px",marginBottom:14}}>{errMsg}</div>}
+          {status==="ok"&&<div style={{fontSize:11,color:"#43d98c",background:"#43d98c11",border:"1px solid #43d98c33",borderRadius:6,padding:"8px 12px",marginBottom:14,textAlign:"center"}}>✓ Connected!</div>}
+          <button
+            onClick={connect}
+            disabled={status==="connecting"||status==="ok"}
+            style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:"#4fc3f7",color:"#0a1628",fontSize:13,fontWeight:800,cursor:"pointer",fontFamily:"inherit",marginBottom:10,opacity:(status==="connecting"||status==="ok")?0.7:1}}
+          >{status==="connecting"?"Connecting…":status==="ok"?"Connected ✓":"Connect"}</button>
+          <div style={{textAlign:"center"}}>
+            <span onClick={onSkip} style={{fontSize:11,color:"#3d5a73",cursor:"pointer",textDecoration:"underline"}}>I'm the teacher — skip this</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Firebase Setup Modal ─────────────────────────────────────────────────────
 function FirebaseSetupModal({connected, roomCode, onConnect, onDisconnect, onClose}) {
   const [apiKey,setApiKey]=useState(()=>LS.get("qc:fbconfig")?.apiKey||"");
@@ -3695,19 +3771,6 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
 
             {(tab==="student"||tab==="register")&&(
               <>
-              {/* Firebase room code — only show if Firebase not yet connected */}
-              {!_fbReady&&roomStatus!=="connected"&&(
-              <div style={{marginBottom:14}}>
-                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Server Code</label>
-                <div style={{display:"flex",gap:8}}>
-                  <input value={roomCode} onChange={e=>setRoomCode(e.target.value)} onKeyDown={e=>e.key==="Enter"&&connectRoom()} placeholder="Paste server code from teacher" style={{...inputStyle,flex:1,fontSize:11}} />
-                  <button onClick={connectRoom} style={{padding:"10px 14px",borderRadius:8,border:"1px solid #1e2d3d",background:"#4fc3f722",color:"#4fc3f7",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
-                    {roomStatus==="connecting"?"…":"Connect"}
-                  </button>
-                </div>
-                {roomStatus==="failed"&&<div style={{fontSize:10,color:"#ff5370",marginTop:4}}>{roomErr||"Connection failed — check the server code"}</div>}
-              </div>
-              )}
               {/* Class join code */}
               {tab==="register"&&(
               <div style={{marginBottom:16}}>
@@ -3889,7 +3952,8 @@ function StudentsModal({students, classes, onClose, resetStudentPassword, delete
 function App() {
   const [sqlJS,setSqlJS]=useState(null);
   const [loading,setLoading]=useState(true);
-  const [loginScreen,setLoginScreen]=useState(true); // true = show login as first screen
+  const [loginScreen,setLoginScreen]=useState(true);
+  const [connectScreen,setConnectScreen]=useState(false); // show server connect screen
   const [fbConnected,setFbConnected]=useState(false);
   const [fbRoomCode,setFbRoomCode]=useState(()=>LS.get("qc:fbconfig")?.roomCode||"");
   const [view,setView]=useState("ide");
@@ -3959,7 +4023,9 @@ function App() {
         if(f){ await activateSession(f,S); await refreshMarathon(cid); await refreshQuizData(cid); }
         else setLoginScreen(true);
       } else {
-        setLoginScreen(true);
+        // No session — show connect screen first if Firebase not yet configured
+        if(!fbOk) setConnectScreen(true);
+        else setLoginScreen(true);
       }
       setLoading(false);
     })();
@@ -5554,7 +5620,14 @@ function App() {
         );
       })()}
 
-      {loginScreen&&(
+      {connectScreen&&!loginScreen&&(
+        <ConnectScreen
+          onConnected={()=>{ setConnectScreen(false); setLoginScreen(true); setFbConnected(true); setFbRoomCode(_fbConfig?.roomCode||""); }}
+          onSkip={()=>{ setConnectScreen(false); setLoginScreen(true); }}
+        />
+      )}
+
+      {loginScreen&&!connectScreen&&(
         <LoginScreen
           classes={classes}
           onLoginTeacher={loginTeacher}
