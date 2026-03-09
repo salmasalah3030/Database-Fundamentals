@@ -129,6 +129,108 @@ const QUIZ_RPTS_KEY = "mysqlide:qrpts";    // shared → { quizId: { qIdx: rewar
 //   multi-line comments, -- comments, MySQL string functions (aliases),
 //   LIMIT x OFFSET y, ON UPDATE CURRENT_TIMESTAMP (stripped).
 
+// ── Rebuild a SQLite table to add/drop PK or FK constraints ─────────────────
+// SQLite doesn't support ALTER TABLE ADD/DROP CONSTRAINT, so we:
+// 1. Read current DDL and data
+// 2. Modify the DDL
+// 3. Rename old table, create new, copy data, drop old
+function rebuildTableWithConstraint(db, tbl, op) {
+  // Get current DDL
+  const ddlRes = db.exec(`SELECT sql FROM sqlite_master WHERE type='table' AND name='${tbl}'`);
+  if (!ddlRes[0]) return { type:"error", message:`Table '${tbl}' not found`, sql:"" };
+  let ddl = ddlRes[0].values[0][0];
+
+  // Get column info
+  const colRes = db.exec(`PRAGMA table_info(${tbl})`);
+  const cols = colRes[0]?.values||[];  // [cid, name, type, notnull, dflt, pk]
+
+  // Get existing FKs
+  const fkRes = db.exec(`PRAGMA foreign_key_list(${tbl})`);
+  // [id, seq, table, from, to, on_update, on_delete, match]
+  const existingFKs = [];
+  const fkMap = {};
+  (fkRes[0]?.values||[]).forEach(r=>{
+    if(!fkMap[r[0]]) { fkMap[r[0]]={id:r[0],refTable:r[2],from:[],to:[],onUpdate:r[5],onDelete:r[6]}; existingFKs.push(fkMap[r[0]]); }
+    fkMap[r[0]].from.push(r[3]); fkMap[r[0]].to.push(r[4]);
+  });
+
+  // Determine PK columns
+  let pkCols = cols.filter(r=>r[5]>0).map(r=>r[1]);
+
+  // Apply operation
+  if(op.addPK) {
+    pkCols = op.addPK;
+  }
+  if(op.dropPK) {
+    pkCols = [];
+  }
+
+  let newFKs = [...existingFKs];
+  if(op.addFK) {
+    newFKs.push({ refTable:op.addFK.refTable, from:op.addFK.from, to:op.addFK.refCol, onDelete:'NO ACTION', onUpdate:'NO ACTION', actions:op.addFK.actions||'' });
+  }
+  if(op.dropFK) {
+    // Drop by constraint name — SQLite stores no names, so try to match by from-col name
+    // We'll drop the FK whose from-col matches the name, or just the first if not found
+    const fkName = op.dropFK.toLowerCase();
+    // Try matching by name pattern or column name
+    const idx = newFKs.findIndex(f=>f.from.join('_').toLowerCase()===fkName||('fk_'+tbl+'_'+f.from.join('_')).toLowerCase()===fkName);
+    if(idx>=0) newFKs.splice(idx,1);
+    else if(newFKs.length) newFKs.pop(); // fallback: remove last FK
+  }
+
+  let modifiedCols = cols;
+  if(op.modifyCol) {
+    // Replace column definition
+    modifiedCols = cols.map(r=> r[1]===op.modifyCol.name ? [r[0],r[1],'__MODIFIED__',r[3],r[4],r[5]] : r);
+  }
+
+  // Build new CREATE TABLE statement
+  const colDefs = modifiedCols.map(r=>{
+    const name=r[1], type=r[2]==='__MODIFIED__'?op.modifyCol.def:r[2];
+    const notNull=r[3]?' NOT NULL':'', dflt=r[4]!=null?` DEFAULT ${r[4]}`:'';
+    // PK inline only if single-column PK
+    if(pkCols.length===1 && pkCols[0]===name) return `"${name}" ${type}${notNull}${dflt} PRIMARY KEY`;
+    return `"${name}" ${type}${notNull}${dflt}`;
+  });
+
+  // Multi-column PK as table constraint
+  if(pkCols.length>1) colDefs.push(`PRIMARY KEY (${pkCols.map(c=>`"${c}"`).join(', ')})`);
+
+  // FK table constraints
+  newFKs.forEach(fk=>{
+    let fkDef = `FOREIGN KEY (${fk.from.map(c=>`"${c}"`).join(',')}) REFERENCES "${fk.refTable}"(${fk.to.map(c=>`"${c}"`).join(',')})`;
+    if(fk.actions) fkDef += ' '+fk.actions;
+    else {
+      if(fk.onDelete && fk.onDelete!=='NO ACTION') fkDef+=` ON DELETE ${fk.onDelete}`;
+      if(fk.onUpdate && fk.onUpdate!=='NO ACTION') fkDef+=` ON UPDATE ${fk.onUpdate}`;
+    }
+    colDefs.push(fkDef);
+  });
+
+  const newDDL = `CREATE TABLE "${tbl}_new" (${colDefs.join(', ')})`;
+
+  // Execute rebuild
+  db.run("PRAGMA foreign_keys = OFF");
+  try {
+    db.run("BEGIN");
+    db.run(newDDL);
+    const colNames = modifiedCols.map(r=>`"${r[1]}"`).join(',');
+    db.run(`INSERT INTO "${tbl}_new" SELECT ${colNames} FROM "${tbl}"`);
+    db.run(`DROP TABLE "${tbl}"`);
+    db.run(`ALTER TABLE "${tbl}_new" RENAME TO "${tbl}"`);
+    db.run("COMMIT");
+  } catch(e) {
+    try { db.run("ROLLBACK"); } catch {}
+    db.run("PRAGMA foreign_keys = ON");
+    return { type:"error", message:e.message, sql:"" };
+  }
+  db.run("PRAGMA foreign_keys = ON");
+
+  const action = op.addPK?"PRIMARY KEY added":op.dropPK?"PRIMARY KEY dropped":op.addFK?"FOREIGN KEY added":op.dropFK?"FOREIGN KEY dropped":op.modifyCol?"Column modified":"Table rebuilt";
+  return { type:"ok", message:`Query OK — ${action} on '${tbl}' (${modifiedCols.length} columns)`, sql:"" };
+}
+
 function mysqlToSQLite(raw) {
   // Returns array of {type:"exec"|"virtual", stmt, handler?}
   const stmts = splitMySQL(raw);
@@ -166,14 +268,12 @@ function mysqlToSQLite(raw) {
         try {
           const res = db.exec(`PRAGMA table_info(${tbl})`);
           if (!res[0]) return { type:"error", message:`Table '${tbl}' doesn't exist`, sql:trimmed };
-          const rows = res[0].values.map(r => [
-            r[1],             // Field
-            r[2],             // Type
-            r[3]?"NO":"YES",  // Null
-            r[5]?"PRI":"",    // Key
-            r[4]??'NULL',     // Default
-            ""                // Extra
-          ]);
+          const fkRes = db.exec(`PRAGMA foreign_key_list(${tbl})`);
+          const fkCols = new Set((fkRes[0]?.values||[]).map(r=>r[3]));
+          const rows = res[0].values.map(r => {
+            const isPK = !!r[5]; const isFK = fkCols.has(r[1]);
+            return [r[1], r[2], r[3]?"NO":"YES", isPK?"PRI":isFK?"MUL":"", r[4]??'NULL', isPK&&r[2]==="INTEGER"?"auto_increment":""];
+          });
           return { type:"table", data:{ columns:["Field","Type","Null","Key","Default","Extra"], values:rows }, sql:trimmed };
         } catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
       }};
@@ -185,7 +285,15 @@ function mysqlToSQLite(raw) {
         try {
           const res = db.exec(`PRAGMA table_info(${tbl})`);
           if (!res[0]) return { type:"error", message:`Table '${tbl}' doesn't exist`, sql:trimmed };
-          const rows = res[0].values.map(r => [r[1],r[2],r[3]?"NO":"YES",r[5]?"PRI":"",r[4]??'NULL',""]);
+          // Get FK columns
+          const fkRes = db.exec(`PRAGMA foreign_key_list(${tbl})`);
+          const fkCols = new Set((fkRes[0]?.values||[]).map(r=>r[3])); // r[3] = from column
+          const rows = res[0].values.map(r => {
+            const isPK = !!r[5];
+            const isFK = fkCols.has(r[1]);
+            const key = isPK ? "PRI" : isFK ? "MUL" : "";
+            return [r[1], r[2], r[3]?"NO":"YES", key, r[4]??'NULL', isPK&&r[2]==="INTEGER"?"auto_increment":""];
+          });
           return { type:"table", data:{ columns:["Field","Type","Null","Key","Default","Extra"], values:rows }, sql:trimmed };
         } catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
       }};
@@ -199,6 +307,19 @@ function mysqlToSQLite(raw) {
           const ddl = res[0]?.values[0]?.[0];
           if (!ddl) return { type:"error", message:`Table '${tbl}' doesn't exist`, sql:trimmed };
           return { type:"table", data:{ columns:["Table","Create Table"], values:[[tbl, ddl]] }, sql:trimmed };
+        } catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
+      }};
+
+    // SHOW FOREIGN KEYS FROM tbl (MySQL-style info)
+    if (/^SHOW\s+FOREIGN\s+KEYS?\s+(FROM|IN)\s+/i.test(trimmed))
+      return { type:"virtual", stmt:trimmed, handler: db => {
+        const tbl = (trimmed.match(/(?:FROM|IN)\s+`?(\w+)`?/i)||[])[1];
+        try {
+          const res = db.exec(`PRAGMA foreign_key_list(${tbl})`);
+          const rows = (res[0]?.values||[]).map(r => [
+            'fk_'+tbl+'_'+r[3], tbl, r[3], r[2], r[4], r[6], r[5]
+          ]);
+          return { type:"table", data:{ columns:["Constraint","Table","Column","Ref Table","Ref Column","On Delete","On Update"], values:rows }, sql:trimmed };
         } catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
       }};
 
@@ -359,6 +480,72 @@ function mysqlToSQLite(raw) {
     // SAVEPOINT / RELEASE SAVEPOINT
     if (/^(SAVEPOINT|RELEASE\s+SAVEPOINT|ROLLBACK\s+TO(\s+SAVEPOINT)?)\s+\w+\s*;?$/i.test(trimmed))
       return { type:"exec", stmt: trimmed.replace(/\s*;?\s*$/, "") };
+
+    // ── ALTER TABLE ADD/DROP PRIMARY KEY / FOREIGN KEY ──────────────────────
+    // SQLite doesn't support ALTER TABLE ADD CONSTRAINT — we intercept and rebuild
+    if (/^ALTER\s+TABLE\s+/i.test(trimmed)) {
+      const alterUpper = trimmed.toUpperCase().replace(/\s+/g,' ');
+
+      // ALTER TABLE t ADD PRIMARY KEY (col, ...)
+      const addPK = trimmed.match(/^ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+(?:CONSTRAINT\s+`?\w+`?\s+)?PRIMARY\s+KEY\s*\(([^)]+)\)/i);
+      if (addPK) {
+        return { type:"virtual", stmt:trimmed, handler: db => {
+          try {
+            const tbl = addPK[1];
+            const pkCols = addPK[2].split(',').map(c=>c.trim().replace(/`/g,''));
+            return rebuildTableWithConstraint(db, tbl, { addPK: pkCols });
+          } catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
+        }};
+      }
+
+      // ALTER TABLE t DROP PRIMARY KEY
+      const dropPK = trimmed.match(/^ALTER\s+TABLE\s+`?(\w+)`?\s+DROP\s+PRIMARY\s+KEY/i);
+      if (dropPK) {
+        return { type:"virtual", stmt:trimmed, handler: db => {
+          try { return rebuildTableWithConstraint(db, dropPK[1], { dropPK: true }); }
+          catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
+        }};
+      }
+
+      // ALTER TABLE t ADD [CONSTRAINT name] FOREIGN KEY (col) REFERENCES ref(col) [ON DELETE ...] [ON UPDATE ...]
+      const addFK = trimmed.match(/^ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+(?:CONSTRAINT\s+`?(\w+)`?\s+)?FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+`?(\w+)`?\s*\(([^)]+)\)([\s\S]*?)(?:;|$)/i);
+      if (addFK) {
+        return { type:"virtual", stmt:trimmed, handler: db => {
+          try {
+            const tbl     = addFK[1];
+            const fkName  = addFK[2]||null;
+            const fromCol = addFK[3].split(',').map(c=>c.trim().replace(/`/g,''));
+            const refTbl  = addFK[4];
+            const refCol  = addFK[5].split(',').map(c=>c.trim().replace(/`/g,''));
+            const actions = (addFK[6]||'').trim();
+            return rebuildTableWithConstraint(db, tbl, { addFK:{ name:fkName, from:fromCol, refTable:refTbl, refCol, actions } });
+          } catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
+        }};
+      }
+
+      // ALTER TABLE t DROP FOREIGN KEY name
+      const dropFK = trimmed.match(/^ALTER\s+TABLE\s+`?(\w+)`?\s+DROP\s+FOREIGN\s+KEY\s+`?(\w+)`?/i);
+      if (dropFK) {
+        return { type:"virtual", stmt:trimmed, handler: db => {
+          try { return rebuildTableWithConstraint(db, dropFK[1], { dropFK: dropFK[2] }); }
+          catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
+        }};
+      }
+
+      // ALTER TABLE t ADD COLUMN ... (SQLite supports this natively — pass through)
+      // ALTER TABLE t RENAME TO ... (SQLite supports natively)
+      // ALTER TABLE t RENAME COLUMN ... (SQLite 3.25+ supports)
+      // ALTER TABLE t MODIFY COLUMN / CHANGE COLUMN → rebuild
+      const modCol = trimmed.match(/^ALTER\s+TABLE\s+`?(\w+)`?\s+(?:MODIFY\s+(?:COLUMN\s+)?|CHANGE\s+(?:COLUMN\s+)?`?\w+`?\s+)`?(\w+)`?\s+(.+?)(?:;|$)/i);
+      if (modCol) {
+        return { type:"virtual", stmt:trimmed, handler: db => {
+          try {
+            const tbl = modCol[1], col = modCol[2], newDef = modCol[3].trim();
+            return rebuildTableWithConstraint(db, tbl, { modifyCol:{ name:col, def:newDef } });
+          } catch(e) { return { type:"error", message:e.message, sql:trimmed }; }
+        }};
+      }
+    }
 
     // Otherwise: transpile MySQL DDL/DML syntax to SQLite
     return { type:"exec", stmt: transpileMySQL(trimmed) };
@@ -738,8 +925,10 @@ function mergeSharedTables(studentDb, sqlJS) {
     var b64 = LS.get("__shared__"+SHARED_DB_KEY);
     if(!b64) return;
     var teacherDb = new sqlJS.Database(Uint8Array.from(atob(b64), function(c){return c.charCodeAt(0);}));
+    try { teacherDb.run("PRAGMA foreign_keys = ON"); } catch {}
+    try { studentDb.run("PRAGMA foreign_keys = OFF"); } catch {} // OFF during merge to avoid FK order issues
     var metaRes = teacherDb.exec("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name");
-    if(!metaRes.length){teacherDb.close();return;}
+    if(!metaRes.length){teacherDb.close();try{studentDb.run("PRAGMA foreign_keys = ON");}catch{} return;}
     metaRes[0].values.forEach(function(row){
       var tname = row[0]; var ddl = row[1];
       if(!tname||!ddl) return;
@@ -757,11 +946,21 @@ function mergeSharedTables(studentDb, sqlJS) {
       } catch(e){}
     });
     teacherDb.close();
+    try { studentDb.run("PRAGMA foreign_keys = ON"); } catch {}
   } catch(e){}
 }
 async function loadDB(sid, S) {
-  try { const v = LS.get(DB_PFX+sid); if (v) return new S.Database(Uint8Array.from(atob(v), c=>c.charCodeAt(0))); } catch {}
-  return new S.Database();
+  try {
+    const v = LS.get(DB_PFX+sid);
+    if (v) {
+      const db = new S.Database(Uint8Array.from(atob(v), c=>c.charCodeAt(0)));
+      try { db.run("PRAGMA foreign_keys = ON"); } catch {}
+      return db;
+    }
+  } catch {}
+  const db = new S.Database();
+  try { db.run("PRAGMA foreign_keys = ON"); } catch {}
+  return db;
 }
 
 
@@ -4333,7 +4532,7 @@ function App() {
     }
     const s={id:uid(),name:newSess.name.trim(),role:newSess.role,color:newSess.color,classId:newSess.classId||null,created:new Date().toISOString()};
     const upd=[...sessions,s]; setSessions(upd); await store.set(SESSIONS_KEY,upd);
-    const database=new sqlJS.Database(); dbRef.current=database; setDb(database); setCurSess(s); setTables([]); setResults([]); setQReg(null); setMReg(null);
+    const database=new sqlJS.Database(); try{database.run('PRAGMA foreign_keys = ON');}catch{} dbRef.current=database; setDb(database); setCurSess(s); setTables([]); setResults([]); setQReg(null); setMReg(null);
     await store.set(CURRENT_KEY,s.id); setNewSess({name:"",role:"student",color:"#4fc3f7",classId:null}); setModal(null); notify(`Session created: ${s.name}`);
   }
 
