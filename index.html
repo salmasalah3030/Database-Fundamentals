@@ -277,7 +277,8 @@ const QUIZZES_KEY   = "mysqlide:quizzes";
 const QUIZ_PFX      = "mysqlide:quiz:";
 const QSUB_PFX      = "mysqlide:qsub:";
 const QSTUDENTS_KEY = "mysqlide:qstudents";
-const CLASSES_KEY   = "mysqlide:classes";
+const CLASSES_KEY   = "mysqlide:classes";  // kept for migration
+const CLASS_GROUPS_KEY = "mysqlide:classgroups"; // {a:{id:"a",name,code}, b:{id:"b",name,code}}
 const WB_PFX        = "mysqlide:wb:";      // WB_PFX+classId → whiteboard state
 const WB_NOTES_PFX  = "mysqlide:wbn:";    // WB_NOTES_PFX+classId → array of sticky notes
 const POINTS_KEY    = "mysqlide:points";   // shared → { studentId: { name, total, log:[{pts,reason,at}] } }
@@ -1128,6 +1129,24 @@ async function loadDB(sid, S) {
 
 
 const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+
+// ── Class Groups — two permanent groups with editable names and join codes ────
+const DEFAULT_GROUPS = [
+  { id:"a", name:"Group A", code:"GRP-A", color:"#4fc3f7" },
+  { id:"b", name:"Group B", code:"GRP-B", color:"#c792ea" },
+];
+async function getClassGroups() {
+  const saved = await store.get(CLASS_GROUPS_KEY, true);
+  return saved || DEFAULT_GROUPS;
+}
+async function saveClassGroups(groups) {
+  await store.set(CLASS_GROUPS_KEY, groups, true);
+}
+// Resolve a student's join code to a group id
+async function resolveClassCode(code) {
+  const groups = await getClassGroups();
+  return groups.find(g => g.code.trim().toUpperCase() === code.trim().toUpperCase()) || null;
+}
 function simpleHash(str) {
   // djb2 — good enough for a classroom tool
   let h = 5381;
@@ -2017,52 +2036,53 @@ function EditorPanel({query,setQuery,taRef,lines,handleKey,db,curSess,results,st
   );
 }
 
-// ─── Class Manager Modal ──────────────────────────────────────────────────────
+// ─── Class Groups Modal (2 permanent groups with editable names & codes) ─────
 const CLASS_COLORS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4","#f07178","#89ddff"];
-function ClassManagerModal({classes,onSave,onDelete,onClose}){
-  const [name,setName]=useState("");
-  const [color,setColor]=useState(CLASS_COLORS[0]);
-  const [editId,setEditId]=useState(null);
-  function startEdit(c){setName(c.name);setColor(c.color);setEditId(c.id);}
-  function cancel(){setName("");setColor(CLASS_COLORS[0]);setEditId(null);}
-  function submit(){if(!name.trim())return;onSave(name.trim(),color,editId);cancel();}
+function ClassManagerModal({classes: groups, onSave, onClose}){
+  const [g, setG] = useState(() => groups.length>=2 ? groups.slice(0,2) : DEFAULT_GROUPS);
+  const [saved, setSaved] = useState(false);
+  const inp = {width:"100%",padding:"9px 12px",background:"#0d1b2a",border:`1px solid ${T.border}`,borderRadius:8,color:T.text,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"};
+  function update(idx, field, val){ setG(prev=>prev.map((x,i)=>i===idx?{...x,[field]:val}:x)); setSaved(false); }
+  async function save(){ await onSave(g); setSaved(true); setTimeout(()=>setSaved(false),2000); }
   return(
     <div className="overlay" onClick={onClose}>
-      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:420}}>
-        <div className="mhdr"><span>🏫 Manage Classes</span><button className="xbtn" onClick={onClose}>✕</button></div>
+      <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:460}}>
+        <div className="mhdr"><span>🏫 Class Groups</span><button className="xbtn" onClick={onClose}>✕</button></div>
         <div className="mbody">
-          {/* Existing classes */}
-          {classes.length>0&&<>
-            <div className="section-hdr" style={{marginBottom:8}}>Your Classes</div>
-            {classes.map(c=>(
-              <div key={c.id} style={{display:"flex",alignItems:"center",gap:9,padding:"8px 10px",background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:8,marginBottom:6}}>
-                <span className="class-dot" style={{background:c.color,width:12,height:12,flexShrink:0}}/>
-                <span style={{flex:1,fontSize:13,fontWeight:600}}>{c.name}</span>
-                <button className="btn btn-ghost btn-sm" style={{padding:"2px 8px"}} onClick={()=>startEdit(c)}>✏</button>
-                <button className="btn btn-ghost btn-sm" style={{padding:"2px 8px",color:"#ff5370"}} onClick={()=>{if(confirm(`Delete class "${c.name}"?`)){onDelete(c.id);}}}>🗑</button>
+          <div style={{fontSize:11,color:T.muted,marginBottom:16,lineHeight:1.6}}>
+            Two permanent class groups. Give each group's <strong style={{color:T.text}}>Join Code</strong> to the matching students — they type it when registering.
+          </div>
+          {g.map((grp,i)=>(
+            <div key={grp.id} style={{background:T.surfaceAlt,border:`1px solid ${grp.color}44`,borderRadius:10,padding:"14px 16px",marginBottom:12}}>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+                <span style={{width:10,height:10,borderRadius:"50%",background:grp.color,display:"inline-block",flexShrink:0}}/>
+                <span style={{fontSize:12,fontWeight:700,color:grp.color}}>Group {i===0?"A":"B"}</span>
               </div>
-            ))}
-            <div className="divider" style={{margin:"12px 0"}}/>
-          </>}
-          {/* Add / Edit form */}
-          <div className="section-hdr" style={{marginBottom:8}}>{editId?"Edit Class":"New Class"}</div>
-          <div className="fg"><label className="flabel">Class Name</label>
-            <input className="finput" autoFocus placeholder="e.g. Class A, Monday Group…" value={name} onChange={e=>setName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()}/>
-          </div>
-          <div className="fg">
-            <label className="flabel">Colour</label>
-            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-              {CLASS_COLORS.map(c=>(
-                <div key={c} onClick={()=>setColor(c)} style={{width:26,height:26,borderRadius:"50%",background:c,cursor:"pointer",border:color===c?"3px solid white":"3px solid transparent",boxShadow:color===c?`0 0 0 2px ${c}`:"none",transition:"all .15s"}}/>
-              ))}
+              <div style={{display:"flex",gap:10,marginBottom:10}}>
+                <div style={{flex:1}}>
+                  <label style={{display:"block",fontSize:9,fontWeight:700,color:T.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Display Name</label>
+                  <input style={inp} value={grp.name} onChange={e=>update(i,"name",e.target.value)} placeholder="e.g. Morning Class"/>
+                </div>
+                <div style={{flex:1}}>
+                  <label style={{display:"block",fontSize:9,fontWeight:700,color:T.muted,marginBottom:5,textTransform:"uppercase",letterSpacing:1}}>Join Code (students type this)</label>
+                  <input style={{...inp,fontFamily:"monospace",letterSpacing:2,fontWeight:700,color:grp.color}} value={grp.code} onChange={e=>update(i,"code",e.target.value.toUpperCase())} placeholder="e.g. MATH-A" maxLength={12}/>
+                </div>
+              </div>
+              <div>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:T.muted,marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Colour</label>
+                <div style={{display:"flex",gap:7}}>
+                  {CLASS_COLORS.map(c=>(
+                    <div key={c} onClick={()=>update(i,"color",c)} style={{width:22,height:22,borderRadius:"50%",background:c,cursor:"pointer",border:grp.color===c?"3px solid white":"3px solid transparent",boxShadow:grp.color===c?`0 0 0 2px ${c}`:"none",transition:"all .15s"}}/>
+                  ))}
+                </div>
+              </div>
             </div>
-          </div>
+          ))}
+          {saved&&<div style={{textAlign:"center",color:T.green,fontSize:12,marginTop:4}}>✓ Saved!</div>}
         </div>
         <div className="mftr">
-          {editId&&<button className="btn btn-ghost btn-sm" onClick={cancel}>Cancel Edit</button>}
-          <div style={{flex:1}}/>
           <button className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
-          <button className="btn btn-purple btn-sm" onClick={submit} disabled={!name.trim()}>{editId?"Save Changes":"+ Add Class"}</button>
+          <button className="btn btn-purple btn-sm" onClick={save}>💾 Save Groups</button>
         </div>
       </div>
     </div>
@@ -3479,11 +3499,24 @@ function FirebaseSetupModal({connected, roomCode, onConnect, onDisconnect, onClo
         <div className="mhdr"><span>🔥 Firebase Setup</span><button className="xbtn" onClick={onClose}>✕</button></div>
         <div className="mbody">
           {connected
-            ?<div style={{textAlign:"center",padding:"12px 0"}}>
-                <div style={{fontSize:28,marginBottom:8}}>✅</div>
-                <div style={{fontSize:14,fontWeight:700,color:"#43d98c",marginBottom:4}}>Connected!</div>
-                <div style={{fontSize:12,color:"#5a7a94",marginBottom:4}}>Room Code: <strong style={{color:"#4fc3f7",fontSize:16,letterSpacing:2}}>{roomCode}</strong></div>
-                <div style={{fontSize:11,color:"#5a7a94",marginBottom:16}}>Share this code with your students when they register.</div>
+            ?<div style={{padding:"4px 0"}}>
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+                  <div style={{fontSize:24}}>✅</div>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:700,color:"#43d98c"}}>Connected to Firebase</div>
+                    <div style={{fontSize:11,color:"#5a7a94"}}>Real-time sync active across all devices</div>
+                  </div>
+                </div>
+                <div style={{marginBottom:14}}>
+                  <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Student Join Code</label>
+                  <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                    <div style={{flex:1,padding:"10px 12px",background:"#0d1b2a",border:"1px solid #43d98c44",borderRadius:8,fontSize:12,fontFamily:"monospace",color:"#43d98c",wordBreak:"break-all",letterSpacing:1}}>
+                      {(()=>{const cfg=LS.get("qc:fbconfig");return cfg?roomCode+"|"+cfg.databaseURL:roomCode;})()}
+                    </div>
+                    <button className="btn btn-ghost btn-sm" onClick={()=>{const cfg=LS.get("qc:fbconfig");navigator.clipboard?.writeText(cfg?roomCode+"|"+cfg.databaseURL:roomCode).catch(()=>{});}} style={{flexShrink:0}}>📋 Copy</button>
+                  </div>
+                  <div style={{fontSize:10,color:"#5a7a94",marginTop:5}}>Give this entire code to your students — they paste it into the Room Code field when registering.</div>
+                </div>
                 <button className="btn btn-red btn-sm" onClick={onDisconnect}>Disconnect</button>
               </div>
             :<>
@@ -3530,41 +3563,59 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
   const [color,setColor]=useState("#4fc3f7");
   const [err,setErr]=useState("");
   const [busy,setBusy]=useState(false);
-  const [classes,setClasses]=useState(initialClasses||[]);
   const [roomCode,setRoomCode]=useState(()=>LS.get("qc:fbconfig")?.roomCode||"");
   const [roomStatus,setRoomStatus]=useState(()=>_fbReady?"connected":"");
+  const [roomErr,setRoomErr]=useState("");
   const COLORS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4"];
 
-  // When Firebase is connected, poll for classes every 2s
-  useEffect(()=>{
-    const refresh=()=>{
-      const cls=LS.get("__shared__"+CLASSES_KEY)||[];
-      setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
-    };
-    refresh();
-    const t=setInterval(refresh,2000);
-    return()=>clearInterval(t);
-  },[]);
 
-  // Auto-select first class
-  useEffect(()=>{
-    if(classes.length>0 && !classId) setClassId(classes[0].id);
-  },[classes]);
 
   async function connectRoom(){
-    if(!roomCode.trim()){setRoomStatus("enter");return;}
-    const saved=LS.get("qc:fbconfig");
-    if(!saved?.apiKey){setRoomStatus("no-config");return;}
+    const rc=roomCode.trim().toUpperCase();
+    if(!rc){setRoomStatus("enter");return;}
     setRoomStatus("connecting");
-    const ok=await initFirebase({...saved,roomCode:roomCode.trim().toUpperCase()});
-    if(ok){
-      subscribeSharedKeys();
-      setRoomStatus("connected");
-      // Immediately fetch classes
-      const cls=await store.get(CLASSES_KEY,true)||[];
-      setClasses(cls);
-    } else {
+    try {
+      // Students only know the room code (e.g. "MATH101").
+      // The teacher may have shared a full join string: "MATH101|https://xxx.firebaseio.com"
+      // OR we try already-saved config from localStorage.
+      let dbURL=null, apiKey=null, finalRoom=rc;
+      if(rc.includes("|")){
+        // Full join string pasted by student
+        const parts=rc.split("|");
+        finalRoom=parts[0].trim();
+        dbURL=parts[1].trim();
+      } else {
+        // Check if we have a saved config for this room
+        const saved=LS.get("qc:fbconfig");
+        if(saved?.apiKey && saved?.databaseURL){
+          dbURL=saved.databaseURL; apiKey=saved.apiKey;
+        }
+      }
+      if(dbURL && !apiKey){
+        // Fetch the config from Firebase REST — no auth needed for test-mode databases
+        // Config was written by teacher at /{roomCode}/_config.json
+        const url=dbURL.replace(/\/$/,"")+"/"+finalRoom+"/_config.json";
+        const resp=await fetch(url);
+        if(!resp.ok) throw new Error("HTTP "+resp.status);
+        const cfg=await resp.json();
+        if(!cfg?.apiKey) throw new Error("No config found — ask teacher to reconnect");
+        apiKey=cfg.apiKey; dbURL=cfg.databaseURL||dbURL;
+      }
+      if(!apiKey||!dbURL){setRoomStatus("no-config");return;}
+      const ok=await initFirebase({apiKey,databaseURL:dbURL,roomCode:finalRoom});
+      if(ok){
+        subscribeSharedKeys();
+        setRoomStatus("connected");
+        setRoomCode(finalRoom);
+        const cls=await store.get(CLASSES_KEY,true)||[];
+        setClasses(cls);
+      } else {
+        setRoomStatus("failed");
+      }
+    } catch(e){
+      console.error("connectRoom error:",e);
       setRoomStatus("failed");
+      setRoomErr(e.message||"Connection failed");
     }
   }
 
@@ -3581,11 +3632,12 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
         if(res==="notfound") setErr("No account found with that name");
         else if(res==="badpass") setErr("Incorrect password");
       } else {
-        if(!name.trim()||!pass.trim()||!pass2.trim()||!classId){setErr("Fill in all fields");return;}
+        if(!name.trim()||!pass.trim()||!pass2.trim()||!classId.trim()){setErr("Fill in all fields including the class join code");return;}
         if(pass!==pass2){setErr("Passwords don't match");return;}
         if(pass.length<3){setErr("Password must be at least 3 characters");return;}
-        const res=await onRegisterStudent(name.trim(),pass,classId,color);
+        const res=await onRegisterStudent(name.trim(),pass,classId.trim(),color);
         if(res==="exists") setErr("That name is already taken");
+        else if(res==="badcode") setErr("Invalid class code — ask your teacher for the correct code");
       }
     } finally { setBusy(false); }
   }
@@ -3643,37 +3695,27 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
 
             {(tab==="student"||tab==="register")&&(
               <>
-              {/* Room Code */}
+              {/* Firebase room code — only show if Firebase not yet connected */}
+              {!_fbReady&&roomStatus!=="connected"&&(
               <div style={{marginBottom:14}}>
-                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Room Code</label>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Server Code</label>
                 <div style={{display:"flex",gap:8}}>
-                  <input value={roomCode} onChange={e=>setRoomCode(e.target.value.toUpperCase())} onKeyDown={e=>e.key==="Enter"&&connectRoom()} placeholder="e.g. MATH101" style={{...inputStyle,flex:1,textTransform:"uppercase",letterSpacing:2,fontWeight:700}} maxLength={12}/>
-                  <button onClick={connectRoom} style={{padding:"10px 14px",borderRadius:8,border:"1px solid #1e2d3d",background:roomStatus==="connected"?"#43d98c22":"#4fc3f722",color:roomStatus==="connected"?"#43d98c":"#4fc3f7",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
-                    {roomStatus==="connecting"?"…":roomStatus==="connected"?"✓ Joined":"Join"}
+                  <input value={roomCode} onChange={e=>setRoomCode(e.target.value)} onKeyDown={e=>e.key==="Enter"&&connectRoom()} placeholder="Paste server code from teacher" style={{...inputStyle,flex:1,fontSize:11}} />
+                  <button onClick={connectRoom} style={{padding:"10px 14px",borderRadius:8,border:"1px solid #1e2d3d",background:"#4fc3f722",color:"#4fc3f7",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+                    {roomStatus==="connecting"?"…":"Connect"}
                   </button>
                 </div>
-                {roomStatus==="failed"&&<div style={{fontSize:10,color:"#ff5370",marginTop:4}}>Could not connect — check the room code with your teacher</div>}
-                {roomStatus==="no-config"&&<div style={{fontSize:10,color:"#ffb347",marginTop:4}}>Your teacher hasn't set up the server yet</div>}
-                {roomStatus==="connected"&&<div style={{fontSize:10,color:"#43d98c",marginTop:4}}>Connected to room {roomCode}</div>}
+                {roomStatus==="failed"&&<div style={{fontSize:10,color:"#ff5370",marginTop:4}}>{roomErr||"Connection failed — check the server code"}</div>}
               </div>
-              <div style={{marginBottom:tab==="register"?16:20}}>
-                <div style={{display:"flex",alignItems:"center",marginBottom:6}}>
-                  <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",textTransform:"uppercase",letterSpacing:1,flex:1}}>Class</label>
-                </div>
-                {classes.length===0
-                  ?<div style={{fontSize:11,color:"#5a7a94",padding:"8px 0"}}>
-                      {roomStatus==="connected"?"No classes created yet — ask your teacher":"Enter your room code above to see classes"}
-                    </div>
-                  :<div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                    {classes.map(c=>(
-                      <div key={c.id} onClick={()=>setClassId(c.id)} style={{padding:"6px 14px",borderRadius:99,border:`2px solid ${classId===c.id?c.color:"#1e2d3d"}`,background:classId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:classId===c.id?c.color:"#3d5a73",transition:"all .15s",display:"flex",alignItems:"center",gap:5}}>
-                        <span style={{width:7,height:7,borderRadius:"50%",background:c.color,display:"inline-block"}}/>
-                        {c.name}
-                      </div>
-                    ))}
-                  </div>
-                }
+              )}
+              {/* Class join code */}
+              {tab==="register"&&(
+              <div style={{marginBottom:16}}>
+                <label style={{display:"block",fontSize:9,fontWeight:700,color:"#3d5a73",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>Class Code</label>
+                <input value={classId} onChange={e=>setClassId(e.target.value.toUpperCase())} onFocus={focusInput} onBlur={blurInput} placeholder="Enter your class code e.g. GRP-A" style={{...inputStyle,fontFamily:"monospace",letterSpacing:2,fontWeight:700,textTransform:"uppercase"}} maxLength={12}/>
+                <div style={{fontSize:10,color:"#3d5a73",marginTop:4}}>Ask your teacher for your class code</div>
               </div>
+              )}
               </>
             )}
 
@@ -3774,11 +3816,11 @@ function StudentsModal({students, classes, onClose, resetStudentPassword, delete
             </div>
             <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10,alignItems:"end"}}>
               <div>
-                <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Class</label>
+                <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Class Group</label>
                 <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                  {classes.map(c=>(
-                    <div key={c.id} onClick={()=>setAddClassId(c.id)} style={{padding:"5px 12px",borderRadius:99,border:`2px solid ${addClassId===c.id?c.color:"#1e2d3d"}`,background:addClassId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:addClassId===c.id?c.color:"#3d5a73",transition:"all .15s"}}>
-                      {c.name}
+                  {classes.map(g=>(
+                    <div key={g.id} onClick={()=>setAddClassId(g.id)} style={{padding:"5px 12px",borderRadius:99,border:`2px solid ${addClassId===g.id?g.color:"#1e2d3d"}`,background:addClassId===g.id?g.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:addClassId===g.id?g.color:"#3d5a73",transition:"all .15s"}}>
+                      {g.name}
                     </div>
                   ))}
                 </div>
@@ -3795,12 +3837,10 @@ function StudentsModal({students, classes, onClose, resetStudentPassword, delete
           </div>
         )}
 
-        {classes.length>1&&(
-          <div style={{display:"flex",gap:6,padding:"10px 20px 0",flexWrap:"wrap"}}>
-            <div onClick={()=>setFilterClass("all")} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass==="all"?"#4fc3f7":"#1e2d3d"}`,background:filterClass==="all"?"#4fc3f722":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass==="all"?"#4fc3f7":"#3d5a73"}}>All</div>
-            {classes.map(c=><div key={c.id} onClick={()=>setFilterClass(c.id)} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass===c.id?c.color:"#1e2d3d"}`,background:filterClass===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass===c.id?c.color:"#3d5a73"}}>{c.name}</div>)}
-          </div>
-        )}
+        <div style={{display:"flex",gap:6,padding:"10px 20px 0",flexWrap:"wrap"}}>
+          <div onClick={()=>setFilterClass("all")} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass==="all"?"#4fc3f7":"#1e2d3d"}`,background:filterClass==="all"?"#4fc3f722":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass==="all"?"#4fc3f7":"#3d5a73"}}>All</div>
+          {classes.map(g=><div key={g.id} onClick={()=>setFilterClass(g.id)} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass===g.id?g.color:"#1e2d3d"}`,background:filterClass===g.id?g.color+"22":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass===g.id?g.color:"#3d5a73"}}>{g.name}</div>)}
+        </div>
 
         <div className="mbody" style={{flex:1,overflowY:"auto"}}>
           {visibleStuds.length===0
@@ -3913,7 +3953,7 @@ function App() {
       const sess=await store.get(SESSIONS_KEY)||[]; setSessions(sess);
       const studs=LS.get("__shared__"+STUDENTS_KEY)||[]; setStudents(studs);
       const cid=await store.get(CURRENT_KEY);
-      const cls=await store.get(CLASSES_KEY,true)||[]; setClasses(cls);
+      const cls=await getClassGroups(); setClasses(cls);
       if(cid){
         const f=sess.find(s=>s.id===cid);
         if(f){ await activateSession(f,S); await refreshMarathon(cid); await refreshQuizData(cid); }
@@ -3936,7 +3976,7 @@ function App() {
     if(view==="marathon"||view==="quiz"||view==="whiteboard"||view==="rewards"||view==="ide"){
       pollRef.current=setInterval(async()=>{
         if(view!=="ide"){ refreshMarathon(); refreshQuizData(); }
-        const cls=await store.get(CLASSES_KEY,true)||[];
+        const cls=await getClassGroups();
         setClasses(prev=>JSON.stringify(prev)===JSON.stringify(cls)?prev:cls);
 
         // Students: re-sync teacher's shared tables every 4s so they always have latest
@@ -4033,25 +4073,10 @@ function App() {
   }
 
   // ── Classes ────────────────────────────────────────────────────────────────
-  async function saveClass(name,color,editId){
-    const cls=await store.get(CLASSES_KEY,true)||[];
-    if(editId){
-      const upd=cls.map(c=>c.id===editId?{...c,name,color}:c);
-      await store.set(CLASSES_KEY,upd,true); setClasses(upd);
-    } else {
-      const nc={id:uid(),name,color,teacherSessionId:curSess?.id,created:new Date().toISOString()};
-      const upd=[...cls,nc]; await store.set(CLASSES_KEY,upd,true); setClasses(upd);
-      setCurClassId(nc.id);
-    }
-    notify("Class saved!");
-  }
-  async function deleteClass(classId){
-    if(!confirm("Delete this class? Quizzes assigned to it will become unclassed.")) return;
-    const cls=await store.get(CLASSES_KEY,true)||[];
-    await store.set(CLASSES_KEY,cls.filter(c=>c.id!==classId),true);
-    setClasses(p=>p.filter(c=>c.id!==classId));
-    if(curClassId===classId) setCurClassId(null);
-    notify("Class deleted");
+  async function saveClass(groups){
+    await saveClassGroups(groups);
+    setClasses(groups);
+    notify("Class groups saved!");
   }
 
 
@@ -4877,7 +4902,11 @@ function App() {
     return "ok";
   }
 
-  async function registerStudent(name, password, classId, color){
+  async function registerStudent(name, password, joinCode, color){
+    // joinCode may be a raw join code like "GRP-A" — resolve to group id
+    const group = await resolveClassCode(joinCode);
+    if(!group) return "badcode";
+    const classId = group.id;
     const studs = LS.get("__shared__"+STUDENTS_KEY)||[];
     if(studs.some(s=>s.name.toLowerCase()===name.toLowerCase())) return "exists";
     const sessId = uid();
@@ -5177,7 +5206,7 @@ function App() {
                         {c.name}
                       </div>
                     ))}
-                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>setModal("manage-classes")}>⚙ Classes</button>
+                    <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>setModal("manage-classes")}>⚙ Groups</button>
                   </div>
                   <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
                     <button className="btn btn-ghost btn-sm" onClick={refreshQuizData}>↻</button>
@@ -5456,7 +5485,7 @@ function App() {
       {modal==="create-quiz"&&<QuizBuilderModal newQuiz={newQuiz} setNewQuiz={setNewQuiz} saveQuiz={saveQuiz} onClose={()=>setModal(null)} classes={classes}/>}
       {modal==="marking"&&markingQuiz&&<MarkingModal markingQuiz={markingQuiz} quizSubs={quizSubs} quizStudents={quizStudents} markScores={markScores} setMarkScores={setMarkScores} markFeedback={markFeedback} setMarkFeedback={setMarkFeedback} saveMarking={saveMarking} onClose={()=>setModal(null)}/>}
 
-      {modal==="manage-classes"&&<ClassManagerModal classes={classes} onSave={saveClass} onDelete={deleteClass} onClose={()=>setModal(null)}/>}
+      {modal==="manage-classes"&&<ClassManagerModal classes={classes} onSave={saveClass} onClose={()=>setModal(null)}/>}
 
       {modal==="firebase-setup"&&<FirebaseSetupModal
         connected={fbConnected}
@@ -5465,6 +5494,8 @@ function App() {
           const ok=await initFirebase(cfg);
           if(ok){
             subscribeSharedKeys();
+            // Write config to Firebase so students can fetch it with just the DB URL + room
+            await fbSet("_config", {apiKey:cfg.apiKey, databaseURL:cfg.databaseURL, roomCode:cfg.roomCode});
             setFbConnected(true);
             setFbRoomCode(cfg.roomCode);
             notify("🔥 Firebase connected! Room: "+cfg.roomCode);
