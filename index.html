@@ -884,7 +884,7 @@ select.finput{cursor:pointer}
 .b-pend{background:rgba(90,122,148,.08);color:${T.muted};border:1px solid ${T.border}}
 .b-marked{background:rgba(199,146,234,.12);color:${T.purple};border:1px solid rgba(199,146,234,.2)}
 .b-partial{background:rgba(255,179,71,.1);color:${T.orange};border:1px solid rgba(255,179,71,.25)}
-.b-scenario{background:rgba(38,198,218,.12);color:${T.teal};border:1px solid rgba(38,198,218,.25)}
+.b-scenario{background:rgba(38,198,218,.12);color:${T.teal};border:1px solid rgba(38,198,218,.25)}.b-teal{background:rgba(199,146,234,.12);color:${T.purple};border:1px solid rgba(199,146,234,.25)}
 .prog-wrap{height:5px;background:${T.bg};border-radius:3px;overflow:hidden}
 .prog-bar{height:100%;border-radius:3px;transition:width .5s ease}
 .mq-pip{width:27px;height:27px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;border:1px solid ${T.border};cursor:pointer;transition:all .15s;user-select:none}
@@ -933,213 +933,577 @@ background:${T.surface};border:1px solid ${T.border};border-radius:10px;padding:
 `;
 
 // ─── ER Canvas ────────────────────────────────────────────────────────────────
+// ─── Logical ERD Canvas (Chen Notation) ─────────────────────────────────────
+// Nodes: entity (rect), weak_entity (double-rect), relationship (diamond),
+//        weak_rel (double-diamond), attribute (ellipse), multi_attr (double-ellipse),
+//        derived_attr (dashed ellipse), key_attr (underlined ellipse)
+// Edges: line (label optional, cardinality optional)
 function ERCanvas({ value, onChange, readOnly=false }) {
   const svgRef = useRef(null);
-  const [entities, setEntities] = useState(value?.entities||[]);
-  const [relations, setRelations] = useState(value?.relations||[]);
-  const [tool, setTool] = useState("select");
-  const [selected, setSelected] = useState(null);
-  const [dragging, setDragging] = useState(null);
-  const [relStart, setRelStart] = useState(null);
-  const [hoverEnt, setHoverEnt] = useState(null);
-  const [editingLabel, setEditingLabel] = useState(null);
-  const [pan, setPan] = useState({x:0,y:0});
+  const [nodes, setNodes]         = useState(value?.nodes||[]);
+  const [edges, setEdges]         = useState(value?.edges||[]);
+  // backward-compat: if old format (entities/relations) convert
+  useEffect(()=>{
+    if(value?.entities && !value?.nodes){
+      const nds=value.entities.map(e=>({id:e.id,kind:'entity',label:e.name,x:e.x,y:e.y,attrs:e.attributes||[]}));
+      const eds=value.relations.map(r=>({id:r.id,from:r.from,to:r.to,label:r.label||'',card:r.cardinality||'1:N'}));
+      setNodes(nds); setEdges(eds);
+    } else {
+      setNodes(value?.nodes||[]); setEdges(value?.edges||[]);
+    }
+  },[value]);
+
+  const [tool, setTool]           = useState('select');
+  const [selected, setSelected]   = useState(null);
+  const [dragging, setDragging]   = useState(null);
+  const [edgeSrc, setEdgeSrc]     = useState(null);
+  const [hov, setHov]             = useState(null);
+  const [pan, setPan]             = useState({x:0,y:0});
   const [isPanning, setIsPanning] = useState(false);
-  const panStart = useRef(null);
+  const panRef = useRef(null);
+  const [editLbl, setEditLbl]     = useState(null); // {id}
 
-  useEffect(()=>{ setEntities(value?.entities||[]); setRelations(value?.relations||[]); },[value?.entities?.length,value?.relations?.length]);
+  const emit=(ns,es)=>{if(onChange)onChange({nodes:ns,edges:es});}
 
-  const emit=(ents,rels)=>{ if(onChange) onChange({entities:ents,relations:rels}); };
-  const svgPt=(e)=>{ const r=svgRef.current.getBoundingClientRect(); return {x:e.clientX-r.left-pan.x,y:e.clientY-r.top-pan.y}; };
+  const svgPt=(e)=>{const r=svgRef.current.getBoundingClientRect();return{x:e.clientX-r.left-pan.x,y:e.clientY-r.top-pan.y};}
+
+  // Node dimensions
+  const NODE_KINDS={
+    entity:{w:140,h:38,label:'Entity'},
+    weak_entity:{w:140,h:38,label:'Weak Entity'},
+    relationship:{w:120,h:44,label:'Relationship'},
+    weak_rel:{w:120,h:44,label:'Weak Rel.'},
+    attribute:{w:110,h:34,label:'Attribute'},
+    multi_attr:{w:110,h:34,label:'Multi-val Attr'},
+    derived_attr:{w:110,h:34,label:'Derived Attr'},
+    key_attr:{w:110,h:34,label:'Key Attr'},
+  };
+  const nW=(n)=>NODE_KINDS[n.kind]?.w||120;
+  const nH=(n)=>NODE_KINDS[n.kind]?.h||36;
+  const cx=(n)=>n.x+nW(n)/2;
+  const cy=(n)=>n.y+nH(n)/2;
 
   const handleSvgClick=(e)=>{
     if(readOnly) return;
-    if(e.target===svgRef.current||e.target.classList.contains("canvas-bg")){
-      if(tool==="entity"){ const pt=svgPt(e); const ent={id:uid(),name:"Entity",x:pt.x-60,y:pt.y-20,attributes:[{id:uid(),name:"id",isPK:true,isFK:false,type:"INT"}]}; const ne=[...entities,ent]; setEntities(ne); emit(ne,relations); setSelected({type:"entity",id:ent.id}); setTool("select"); }
-      else { setSelected(null); setRelStart(null); }
+    if(e.target===svgRef.current||e.target.classList.contains('cvbg')){
+      if(tool!=='select'&&tool!=='edge'){
+        const pt=svgPt(e);
+        const kind=tool;
+        const def=NODE_KINDS[kind];
+        const nd={id:uid(),kind,label:def.label,x:pt.x-def.w/2,y:pt.y-def.h/2};
+        const nn=[...nodes,nd]; setNodes(nn); emit(nn,edges);
+        setSelected({type:'node',id:nd.id}); setTool('select');
+      } else { setSelected(null); setEdgeSrc(null); }
     }
   };
 
-  const handleMouseDown=(e,entId)=>{
-    if(readOnly) return;
+  const handleNodeDown=(e,nid)=>{
+    if(readOnly){e.stopPropagation();return;}
     e.stopPropagation();
-    if(tool==="relation"){
-      if(!relStart){ setRelStart(entId); setHoverEnt(entId); }
-      else if(relStart!==entId){ const rel={id:uid(),from:relStart,to:entId,label:"relates to",cardinality:"1:N"}; const nr=[...relations,rel]; setRelations(nr); emit(entities,nr); setRelStart(null); setTool("select"); setSelected({type:"relation",id:rel.id}); }
-      else { setRelStart(null); }
+    if(tool==='edge'){
+      if(!edgeSrc){setEdgeSrc(nid);}
+      else if(edgeSrc!==nid){
+        const ed={id:uid(),from:edgeSrc,to:nid,label:'',card:''};
+        const ne=[...edges,ed]; setEdges(ne); emit(nodes,ne);
+        setEdgeSrc(null); setTool('select'); setSelected({type:'edge',id:ed.id});
+      } else setEdgeSrc(null);
       return;
     }
-    const ent=entities.find(en=>en.id===entId);
-    setDragging({id:entId,ox:e.clientX-ent.x,oy:e.clientY-ent.y});
-    setSelected({type:"entity",id:entId});
+    const nd=nodes.find(n=>n.id===nid);
+    setDragging({id:nid,ox:e.clientX-nd.x,oy:e.clientY-nd.y});
+    setSelected({type:'node',id:nid});
   };
 
-  const handleMouseMove=useCallback((e)=>{
-    if(dragging){ const nx=e.clientX-dragging.ox,ny=e.clientY-dragging.oy; setEntities(ents=>ents.map(en=>en.id===dragging.id?{...en,x:nx,y:ny}:en)); }
-    if(isPanning&&panStart.current) setPan({x:e.clientX-panStart.current.ox,y:e.clientY-panStart.current.oy});
+  const handleMM=useCallback((e)=>{
+    if(dragging){const nx=e.clientX-dragging.ox,ny=e.clientY-dragging.oy;setNodes(ns=>ns.map(n=>n.id===dragging.id?{...n,x:nx,y:ny}:n));}
+    if(isPanning&&panRef.current)setPan({x:e.clientX-panRef.current.ox,y:e.clientY-panRef.current.oy});
   },[dragging,isPanning]);
 
-  const handleMouseUp=useCallback(()=>{
-    if(dragging){ emit(entities,relations); setDragging(null); }
-    if(isPanning){ setIsPanning(false); panStart.current=null; }
-  },[dragging,isPanning,entities,relations]);
+  const handleMU=useCallback(()=>{
+    if(dragging){emit(nodes,edges);setDragging(null);}
+    if(isPanning){setIsPanning(false);panRef.current=null;}
+  },[dragging,isPanning,nodes,edges]);
 
   useEffect(()=>{
-    window.addEventListener("mousemove",handleMouseMove);
-    window.addEventListener("mouseup",handleMouseUp);
-    return()=>{ window.removeEventListener("mousemove",handleMouseMove); window.removeEventListener("mouseup",handleMouseUp); };
-  },[handleMouseMove,handleMouseUp]);
+    window.addEventListener('mousemove',handleMM);window.addEventListener('mouseup',handleMU);
+    return()=>{window.removeEventListener('mousemove',handleMM);window.removeEventListener('mouseup',handleMU);};
+  },[handleMM,handleMU]);
 
-  const addAttr=(entId)=>{ const ne=entities.map(en=>en.id===entId?{...en,attributes:[...en.attributes,{id:uid(),name:"attr",isPK:false,isFK:false,type:"VARCHAR(100)"}]}:en); setEntities(ne); emit(ne,relations); };
-  const updateAttr=(entId,attrId,field,val)=>{ const ne=entities.map(en=>en.id===entId?{...en,attributes:en.attributes.map(a=>a.id===attrId?{...a,[field]:val}:a)}:en); setEntities(ne); emit(ne,relations); };
-  const removeAttr=(entId,attrId)=>{ const ne=entities.map(en=>en.id===entId?{...en,attributes:en.attributes.filter(a=>a.id!==attrId)}:en); setEntities(ne); emit(ne,relations); };
-  const updateEntity=(id,field,val)=>{ const ne=entities.map(en=>en.id===id?{...en,[field]:val}:en); setEntities(ne); emit(ne,relations); };
-  const removeEntity=(id)=>{ const ne=entities.filter(en=>en.id!==id); const nr=relations.filter(r=>r.from!==id&&r.to!==id); setEntities(ne); setRelations(nr); emit(ne,nr); setSelected(null); };
-  const updateRelation=(id,field,val)=>{ const nr=relations.map(r=>r.id===id?{...r,[field]:val}:r); setRelations(nr); emit(entities,nr); };
-  const removeRelation=(id)=>{ const nr=relations.filter(r=>r.id!==id); setRelations(nr); emit(entities,nr); setSelected(null); };
+  const delSelected=()=>{
+    if(!selected)return;
+    if(selected.type==='node'){const nn=nodes.filter(n=>n.id!==selected.id);const ne=edges.filter(e=>e.from!==selected.id&&e.to!==selected.id);setNodes(nn);setEdges(ne);emit(nn,ne);}
+    else{const ne=edges.filter(e=>e.id!==selected.id);setEdges(ne);emit(nodes,ne);}
+    setSelected(null);
+  };
 
-  const entH=(ent)=>34+ent.attributes.length*22;
-  const entW=152;
-  const relMid=(r)=>{ const f=entities.find(e=>e.id===r.from),t=entities.find(e=>e.id===r.to); if(!f||!t) return null; const fx=f.x+entW/2,fy=f.y+entH(f)/2,tx=t.x+entW/2,ty=t.y+entH(t)/2; return{x:(fx+tx)/2,y:(fy+ty)/2,fx,fy,tx,ty}; };
+  const updateNode=(id,field,val)=>{const nn=nodes.map(n=>n.id===id?{...n,[field]:val}:n);setNodes(nn);emit(nn,edges);};
+  const updateEdge=(id,field,val)=>{const ne=edges.map(e=>e.id===id?{...e,[field]:val}:e);setEdges(ne);emit(nodes,ne);};
 
-  const selEnt=selected?.type==="entity"?entities.find(e=>e.id===selected.id):null;
-  const selRel=selected?.type==="relation"?relations.find(r=>r.id===selected.id):null;
-  const SQL_TYPES=["INT","BIGINT","VARCHAR(50)","VARCHAR(100)","VARCHAR(255)","TEXT","DATE","DATETIME","DECIMAL(10,2)","BOOLEAN","FLOAT"];
+  const selNode=selected?.type==='node'?nodes.find(n=>n.id===selected.id):null;
+  const selEdge=selected?.type==='edge'?edges.find(e=>e.id===selected.id):null;
+
+  // Draw a node shape
+  const renderNode=(nd)=>{
+    const isSel=selected?.id===nd.id;
+    const isEdgeSrc=edgeSrc===nd.id;
+    const isHov=hov===nd.id&&tool==='edge'&&edgeSrc&&edgeSrc!==nd.id;
+    const w=nW(nd),h=nH(nd);
+    const stroke=isEdgeSrc?T.orange:isSel?T.accent:isHov?T.green:T.border;
+    const sw=isSel?2.5:1.5;
+
+    const lbl=editLbl===nd.id
+      ?<foreignObject x={2} y={h/2-11} width={w-4} height={22}>
+          <input xmlns="http://www.w3.org/1999/xhtml"
+            style={{width:'100%',background:'transparent',border:'none',outline:'none',color:'#d6e4f0',fontWeight:700,fontSize:12,fontFamily:"'Syne',sans-serif",textAlign:'center'}}
+            defaultValue={nd.label} autoFocus
+            onBlur={e2=>{updateNode(nd.id,'label',e2.target.value);setEditLbl(null);}}
+            onKeyDown={e2=>{if(e2.key==='Enter'){updateNode(nd.id,'label',e2.target.value);setEditLbl(null);}e2.stopPropagation();}}
+            onClick={e2=>e2.stopPropagation()}/>
+        </foreignObject>
+      :<text x={w/2} y={h/2+1} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight={700}
+          fill={T.text} fontFamily="'Syne',sans-serif" style={{pointerEvents:readOnly?'none':'all',cursor:'text',userSelect:'none'}}
+          onDoubleClick={e2=>{e2.stopPropagation();if(!readOnly)setEditLbl(nd.id);}}>
+          {nd.label}
+        </text>;
+
+    let shape=null;
+    if(nd.kind==='entity'){
+      shape=<><rect x={0} y={0} width={w} height={h} rx={4} fill={T.surfaceAlt} stroke={stroke} strokeWidth={sw}/>{lbl}</>;
+    } else if(nd.kind==='weak_entity'){
+      shape=<><rect x={0} y={0} width={w} height={h} rx={4} fill={T.surfaceAlt} stroke={stroke} strokeWidth={sw}/>
+        <rect x={4} y={4} width={w-8} height={h-8} rx={2} fill="none" stroke={stroke} strokeWidth={1}/>{lbl}</>;
+    } else if(nd.kind==='relationship'){
+      const hx=w/2,hy=h/2;
+      shape=<><polygon points={`${hx},0 ${w},${hy} ${hx},${h} 0,${hy}`} fill={T.surface} stroke={stroke} strokeWidth={sw}/>{lbl}</>;
+    } else if(nd.kind==='weak_rel'){
+      const hx=w/2,hy=h/2;
+      const inset=5;
+      const ihx=hx,ihy=hy;
+      shape=<><polygon points={`${hx},0 ${w},${hy} ${hx},${h} 0,${hy}`} fill={T.surface} stroke={stroke} strokeWidth={sw}/>
+        <polygon points={`${ihx},${inset} ${w-inset},${ihy} ${ihx},${h-inset} ${inset},${ihy}`} fill="none" stroke={stroke} strokeWidth={1}/>{lbl}</>;
+    } else if(nd.kind==='attribute'){
+      shape=<><ellipse cx={w/2} cy={h/2} rx={w/2} ry={h/2} fill={T.surface} stroke={stroke} strokeWidth={sw}/>{lbl}</>;
+    } else if(nd.kind==='multi_attr'){
+      shape=<><ellipse cx={w/2} cy={h/2} rx={w/2} ry={h/2} fill={T.surface} stroke={stroke} strokeWidth={sw}/>
+        <ellipse cx={w/2} cy={h/2} rx={w/2-4} ry={h/2-4} fill="none" stroke={stroke} strokeWidth={1}/>{lbl}</>;
+    } else if(nd.kind==='derived_attr'){
+      shape=<><ellipse cx={w/2} cy={h/2} rx={w/2} ry={h/2} fill={T.surface} stroke={stroke} strokeWidth={sw} strokeDasharray="5 3"/>{lbl}</>;
+    } else if(nd.kind==='key_attr'){
+      shape=<><ellipse cx={w/2} cy={h/2} rx={w/2} ry={h/2} fill={T.surface} stroke={stroke} strokeWidth={sw}/>
+        <text x={w/2} y={h/2+1} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight={700}
+          fill={T.text} fontFamily="'Syne',sans-serif" style={{textDecoration:'underline',pointerEvents:readOnly?'none':'all',cursor:'text',userSelect:'none'}}
+          onDoubleClick={e2=>{e2.stopPropagation();if(!readOnly)setEditLbl(nd.id);}}>{nd.label}</text></>;
+      return shape; // skip default lbl
+    }
+    return shape;
+  };
+
+  const TOOLS=[
+    ['select','🖱','Select'],['edge','🔗','Connect'],
+    ['entity','▭','Entity'],['weak_entity','▬','Weak Entity'],
+    ['relationship','◇','Relationship'],['weak_rel','⬡','Weak Rel.'],
+    ['attribute','○','Attribute'],['key_attr','<u>○</u>','Key Attr'],
+    ['multi_attr','⊙','Multi Attr'],['derived_attr','◌','Derived Attr'],
+  ];
 
   return (
-    <div style={{display:"flex",flexDirection:"column",height:"100%",background:T.bg}}>
+    <div style={{display:'flex',flexDirection:'column',height:'100%',background:T.bg}}>
       {!readOnly&&(
-        <div style={{display:"flex",alignItems:"center",gap:6,padding:"6px 10px",background:T.surface,borderBottom:`1px solid ${T.border}`,flexShrink:0,flexWrap:"wrap"}}>
-          {[["select","🖱 Select"],["entity","📦 Add Entity"],["relation","🔗 Add Relation"]].map(([t,l])=>(
-            <button key={t} className={`btn btn-sm ${tool===t?"btn-run":"btn-ghost"}`} onClick={()=>{setTool(t);setRelStart(null);}}>{l}</button>
+        <div style={{display:'flex',alignItems:'center',gap:4,padding:'5px 8px',background:T.surface,borderBottom:`1px solid ${T.border}`,flexShrink:0,flexWrap:'wrap'}}>
+          {TOOLS.map(([t,ico,lbl])=>(
+            <button key={t} className={`btn btn-sm ${tool===t?'btn-run':'btn-ghost'}`}
+              style={{fontSize:10,padding:'3px 7px'}}
+              onClick={()=>{setTool(t);setEdgeSrc(null);}}
+              dangerouslySetInnerHTML={{__html:`${ico} ${lbl}`}}/>
           ))}
           <div style={{flex:1}}/>
-          {relStart&&<span style={{fontSize:10,color:T.orange,fontWeight:600}}>📍 Click target entity…</span>}
-          {selected&&<button className="btn btn-red btn-sm" onClick={()=>{if(selEnt)removeEntity(selEnt.id);if(selRel)removeRelation(selRel.id);}}>🗑 Delete</button>}
-          <button className="btn btn-ghost btn-sm" onClick={()=>{setEntities([]);setRelations([]);emit([],[]);setSelected(null);}}>Clear</button>
+          {edgeSrc&&<span style={{fontSize:10,color:T.orange,fontWeight:600}}>📍 Click target node…</span>}
+          {selected&&<button className="btn btn-red btn-sm" style={{fontSize:10}} onClick={delSelected}>🗑 Delete</button>}
+          <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>{setNodes([]);setEdges([]);emit([],[]);setSelected(null);}}>Clear</button>
         </div>
       )}
-      <div style={{display:"flex",flex:1,overflow:"hidden"}}>
+      <div style={{display:'flex',flex:1,overflow:'hidden'}}>
         <svg ref={svgRef} width="100%" height="100%"
-          style={{flex:1,background:T.bg,cursor:tool==="entity"?"crosshair":tool==="relation"?"cell":"default",userSelect:"none",minWidth:0}}
-          onClick={handleSvgClick}>
+          style={{flex:1,background:T.bg,cursor:tool==='select'?'default':tool==='edge'?'cell':'crosshair',userSelect:'none',minWidth:0}}
+          onClick={handleSvgClick}
+          onMouseDown={e=>{if(e.target===svgRef.current||e.target.classList.contains('cvbg')){if(e.button===1||(e.button===0&&tool==='select'&&!e.altKey)){setIsPanning(true);panRef.current={ox:e.clientX-pan.x,oy:e.clientY-pan.y};}}}}>
           <defs>
-            <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse" x={pan.x%24} y={pan.y%24}>
+            <pattern id="ercvgrid" width="24" height="24" patternUnits="userSpaceOnUse" x={pan.x%24} y={pan.y%24}>
               <path d="M 24 0 L 0 0 0 24" fill="none" stroke={T.border} strokeWidth="0.5" opacity="0.4"/>
             </pattern>
-            <marker id="arr" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill={T.muted}/></marker>
-            <marker id="arr-s" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill={T.accent}/></marker>
           </defs>
-          <rect width="100%" height="100%" fill="url(#grid)" className="canvas-bg"/>
+          <rect width="100%" height="100%" fill="url(#ercvgrid)" className="cvbg"/>
           <g transform={`translate(${pan.x},${pan.y})`}>
-            {relations.map(r=>{
-              const m=relMid(r); if(!m) return null;
-              const isSel=selected?.id===r.id; const color=isSel?T.accent:T.muted;
+            {edges.map(ed=>{
+              const fn=nodes.find(n=>n.id===ed.from),tn=nodes.find(n=>n.id===ed.to);
+              if(!fn||!tn) return null;
+              const x1=cx(fn),y1=cy(fn),x2=cx(tn),y2=cy(tn);
+              const mx=(x1+x2)/2,my=(y1+y2)/2;
+              const isSel=selected?.id===ed.id;
               return (
-                <g key={r.id} onClick={e=>{e.stopPropagation();if(!readOnly)setSelected({type:"relation",id:r.id});}}>
-                  <line x1={m.fx} y1={m.fy} x2={m.tx} y2={m.ty} stroke={color} strokeWidth={isSel?2.5:1.5} strokeDasharray={r.cardinality==="N:M"?"6 3":"none"} markerEnd={`url(#arr${isSel?"-s":""})`} style={{cursor:"pointer"}}/>
-                  <rect x={m.x-28} y={m.y-11} width={56} height={22} rx={5} fill={T.surface} stroke={color} strokeWidth={isSel?1.5:1} style={{cursor:"pointer"}}/>
-                  <text x={m.x} y={m.y+5} textAnchor="middle" fontSize={10} fill={color} style={{pointerEvents:"none",fontFamily:"'Syne',sans-serif",fontWeight:700}}>{r.cardinality}</text>
+                <g key={ed.id} onClick={e=>{e.stopPropagation();if(!readOnly)setSelected({type:'edge',id:ed.id});}}>
+                  <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={isSel?T.accent:T.muted} strokeWidth={isSel?2.5:1.5} style={{cursor:'pointer'}}/>
+                  {(ed.label||ed.card)&&(
+                    <g>
+                      <rect x={mx-24} y={my-10} width={48} height={20} rx={4} fill={T.surfaceAlt} stroke={isSel?T.accent:T.border} strokeWidth={1}/>
+                      <text x={mx} y={my+1} textAnchor="middle" dominantBaseline="middle" fontSize={9} fill={isSel?T.accent:T.muted} fontFamily="'Syne',sans-serif" fontWeight={700} style={{pointerEvents:'none'}}>{ed.card||ed.label}</text>
+                    </g>
+                  )}
                 </g>
               );
             })}
-            {entities.map(ent=>{
-              const isSel=selected?.id===ent.id; const isRelSrc=relStart===ent.id;
-              const isHov=hoverEnt===ent.id&&tool==="relation"&&relStart&&relStart!==ent.id;
-              const h=entH(ent); const bc=isRelSrc?T.orange:isSel?T.accent:isHov?T.green:T.border;
+            {nodes.map(nd=>(
+              <g key={nd.id} transform={`translate(${nd.x},${nd.y})`}
+                onMouseDown={e=>handleNodeDown(e,nd.id)}
+                onMouseEnter={()=>setHov(nd.id)} onMouseLeave={()=>setHov(null)}
+                style={{cursor:tool==='edge'?'pointer':'move'}}>
+                {renderNode(nd)}
+              </g>
+            ))}
+          </g>
+        </svg>
+        {/* Properties panel */}
+        {!readOnly&&(selNode||selEdge)&&(
+          <div style={{width:200,background:T.surface,borderLeft:`1px solid ${T.border}`,overflow:'auto',flexShrink:0,fontSize:11,padding:10}}>
+            {selNode&&(
+              <>
+                <div style={{fontWeight:700,fontSize:11,marginBottom:8,color:T.accent,textTransform:'uppercase',letterSpacing:.5}}>Node</div>
+                <div className="fg"><label className="flabel">Label</label>
+                  <input className="finput" style={{fontSize:11}} value={selNode.label} onChange={e=>updateNode(selNode.id,'label',e.target.value)}/>
+                </div>
+                <div className="fg"><label className="flabel">Kind</label>
+                  <select className="finput" style={{fontSize:10}} value={selNode.kind} onChange={e=>updateNode(selNode.id,'kind',e.target.value)}>
+                    {Object.entries(NODE_KINDS).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+                  </select>
+                </div>
+              </>
+            )}
+            {selEdge&&(
+              <>
+                <div style={{fontWeight:700,fontSize:11,marginBottom:8,color:T.accent,textTransform:'uppercase',letterSpacing:.5}}>Edge</div>
+                <div className="fg"><label className="flabel">Label</label>
+                  <input className="finput" style={{fontSize:11}} value={selEdge.label||''} onChange={e=>updateEdge(selEdge.id,'label',e.target.value)}/>
+                </div>
+                <div className="fg"><label className="flabel">Cardinality</label>
+                  <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+                    {['1','N','M','1:1','1:N','N:M','total','partial'].map(c=>(
+                      <button key={c} className={`btn btn-sm ${selEdge.card===c?'btn-run':'btn-ghost'}`}
+                        style={{fontSize:9,padding:'2px 5px'}} onClick={()=>updateEdge(selEdge.id,'card',c)}>{c}</button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{fontSize:10,color:T.muted,marginTop:4}}>{nodes.find(n=>n.id===selEdge.from)?.label} → {nodes.find(n=>n.id===selEdge.to)?.label}</div>
+              </>
+            )}
+          </div>
+        )}
+        {readOnly&&nodes.length>0&&(
+          <div style={{width:140,background:T.surface,borderLeft:`1px solid ${T.border}`,padding:8,overflow:'auto',flexShrink:0}}>
+            <div style={{fontSize:9,color:T.muted,textTransform:'uppercase',letterSpacing:1,marginBottom:6}}>Diagram</div>
+            {nodes.map(n=>(
+              <div key={n.id} style={{marginBottom:4,fontSize:10,color:T.text}}>
+                <span style={{fontSize:9,color:T.muted,marginRight:4}}>{NODE_KINDS[n.kind]?.label?.slice(0,4)||''}</span>{n.label}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Physical ERD / Relational Model Canvas ───────────────────────────────────
+// Tables with columns (name, type, PK, FK), FK arrows between tables
+function RelationalCanvas({ value, onChange, readOnly=false }) {
+  const svgRef = useRef(null);
+  const [tables, setTables]       = useState(value?.tables||[]);
+  const [fkeys,  setFkeys]        = useState(value?.fkeys||[]);
+  const [tool,   setTool]         = useState('select');
+  const [selected, setSelected]   = useState(null);
+  const [dragging, setDragging]   = useState(null);
+  const [fkSrc,  setFkSrc]        = useState(null); // {tableId, colId}
+  const [hov,    setHov]          = useState(null);
+  const [pan,    setPan]          = useState({x:0,y:0});
+  const [isPanning,setIsPanning]  = useState(false);
+  const panRef = useRef(null);
+
+  useEffect(()=>{setTables(value?.tables||[]);setFkeys(value?.fkeys||[]);},[value?.tables?.length,value?.fkeys?.length]);
+
+  const emit=(ts,fks)=>{if(onChange)onChange({tables:ts,fkeys:fks});}
+
+  const COL_H=22, HDR_H=30, TBL_W=180;
+  const tblH=(t)=>HDR_H+t.cols.length*COL_H;
+  const colY=(t,ci)=>HDR_H+ci*COL_H+COL_H/2; // center of col row
+  const tblCx=(t)=>t.x+TBL_W/2;
+  const tblColCy=(t,ci)=>t.y+colY(t,ci);
+
+  const svgPt=(e)=>{const r=svgRef.current.getBoundingClientRect();return{x:e.clientX-r.left-pan.x,y:e.clientY-r.top-pan.y};}
+
+  const addTable=(pt)=>{
+    const t={id:uid(),name:'Table',x:pt.x-TBL_W/2,y:pt.y-40,
+      cols:[{id:uid(),name:'id',type:'INT',pk:true,fk:false,nn:true}]};
+    const nt=[...tables,t];setTables(nt);emit(nt,fkeys);
+    setSelected({type:'table',id:t.id});setTool('select');
+  };
+
+  const handleSvgClick=(e)=>{
+    if(readOnly)return;
+    if(e.target===svgRef.current||e.target.classList.contains('rcvbg')){
+      if(tool==='table'){addTable(svgPt(e));}
+      else{setSelected(null);setFkSrc(null);}
+    }
+  };
+
+  const handleTblDown=(e,tid)=>{
+    if(readOnly){e.stopPropagation();return;}
+    e.stopPropagation();
+    if(tool==='fk'){setFkSrc({tableId:tid,colId:null});return;}
+    const t=tables.find(t=>t.id===tid);
+    setDragging({id:tid,ox:e.clientX-t.x,oy:e.clientY-t.y});
+    setSelected({type:'table',id:tid});
+  };
+
+  const handleColClick=(e,tid,cid)=>{
+    if(readOnly)return;
+    e.stopPropagation();
+    if(tool==='fk'){
+      if(!fkSrc){setFkSrc({tableId:tid,colId:cid});}
+      else if(fkSrc.tableId!==tid){
+        const fk={id:uid(),fromTable:fkSrc.tableId,fromCol:fkSrc.colId,toTable:tid,toCol:cid,card:'N:1'};
+        const nf=[...fkeys,fk];setFkeys(nf);emit(tables,nf);
+        // Mark FK column
+        const nt=tables.map(t=>t.id===fkSrc.tableId?{...t,cols:t.cols.map(c=>c.id===fkSrc.colId?{...c,fk:true}:c)}:t);
+        setTables(nt);emit(nt,nf);
+        setFkSrc(null);setTool('select');setSelected({type:'fk',id:fk.id});
+      } else setFkSrc(null);
+      return;
+    }
+    setSelected({type:'col',tableId:tid,id:cid});
+  };
+
+  const handleMM=useCallback((e)=>{
+    if(dragging){const nx=e.clientX-dragging.ox,ny=e.clientY-dragging.oy;setTables(ts=>ts.map(t=>t.id===dragging.id?{...t,x:nx,y:ny}:t));}
+    if(isPanning&&panRef.current)setPan({x:e.clientX-panRef.current.ox,y:e.clientY-panRef.current.oy});
+  },[dragging,isPanning]);
+  const handleMU=useCallback(()=>{
+    if(dragging){emit(tables,fkeys);setDragging(null);}
+    if(isPanning){setIsPanning(false);panRef.current=null;}
+  },[dragging,isPanning,tables,fkeys]);
+  useEffect(()=>{
+    window.addEventListener('mousemove',handleMM);window.addEventListener('mouseup',handleMU);
+    return()=>{window.removeEventListener('mousemove',handleMM);window.removeEventListener('mouseup',handleMU);};
+  },[handleMM,handleMU]);
+
+  const addCol=(tid)=>{const nt=tables.map(t=>t.id===tid?{...t,cols:[...t.cols,{id:uid(),name:'col',type:'VARCHAR(100)',pk:false,fk:false,nn:false}]}:t);setTables(nt);emit(nt,fkeys);};
+  const updCol=(tid,cid,f,v)=>{const nt=tables.map(t=>t.id===tid?{...t,cols:t.cols.map(c=>c.id===cid?{...c,[f]:v}:c)}:t);setTables(nt);emit(nt,fkeys);};
+  const delCol=(tid,cid)=>{const nt=tables.map(t=>t.id===tid?{...t,cols:t.cols.filter(c=>c.id!==cid)}:t);setTables(nt);emit(nt,fkeys);};
+  const updTbl=(tid,f,v)=>{const nt=tables.map(t=>t.id===tid?{...t,[f]:v}:t);setTables(nt);emit(nt,fkeys);};
+  const delSelected=()=>{
+    if(!selected)return;
+    if(selected.type==='table'){const nt=tables.filter(t=>t.id!==selected.id);const nf=fkeys.filter(f=>f.fromTable!==selected.id&&f.toTable!==selected.id);setTables(nt);setFkeys(nf);emit(nt,nf);}
+    else if(selected.type==='fk'){const nf=fkeys.filter(f=>f.id!==selected.id);setFkeys(nf);emit(tables,nf);}
+    setSelected(null);
+  };
+
+  const selTbl=selected?.type==='table'?tables.find(t=>t.id===selected.id):null;
+  const selCol=selected?.type==='col'?tables.find(t=>t.id===selected.tableId)?.cols.find(c=>c.id===selected.id):null;
+  const selFk=selected?.type==='fk'?fkeys.find(f=>f.id===selected.id):null;
+
+  const SQL_TYPES=["INT","BIGINT","VARCHAR(50)","VARCHAR(100)","VARCHAR(255)","TEXT","DATE","DATETIME","DECIMAL(10,2)","BOOLEAN","FLOAT","CHAR(10)"];
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100%',background:T.bg}}>
+      {!readOnly&&(
+        <div style={{display:'flex',alignItems:'center',gap:4,padding:'5px 8px',background:T.surface,borderBottom:`1px solid ${T.border}`,flexShrink:0,flexWrap:'wrap'}}>
+          {[['select','🖱 Select'],['table','🗃 Add Table'],['fk','🔗 Add FK']].map(([t,l])=>(
+            <button key={t} className={`btn btn-sm ${tool===t?'btn-run':'btn-ghost'}`} style={{fontSize:10}} onClick={()=>{setTool(t);setFkSrc(null);}}>{l}</button>
+          ))}
+          <div style={{flex:1}}/>
+          {fkSrc&&<span style={{fontSize:10,color:T.orange,fontWeight:600}}>📍 Click target column…</span>}
+          {selected&&<button className="btn btn-red btn-sm" style={{fontSize:10}} onClick={delSelected}>🗑 Delete</button>}
+          <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>{setTables([]);setFkeys([]);emit([],[]);setSelected(null);}}>Clear</button>
+        </div>
+      )}
+      <div style={{display:'flex',flex:1,overflow:'hidden'}}>
+        <svg ref={svgRef} width="100%" height="100%"
+          style={{flex:1,background:T.bg,cursor:tool==='table'?'crosshair':tool==='fk'?'cell':'default',userSelect:'none',minWidth:0}}
+          onClick={handleSvgClick}
+          onMouseDown={e=>{if(e.target===svgRef.current||e.target.classList.contains('rcvbg')){setIsPanning(true);panRef.current={ox:e.clientX-pan.x,oy:e.clientY-pan.y};}}}>
+          <defs>
+            <pattern id="relcvgrid" width="24" height="24" patternUnits="userSpaceOnUse" x={pan.x%24} y={pan.y%24}>
+              <path d="M 24 0 L 0 0 0 24" fill="none" stroke={T.border} strokeWidth="0.5" opacity="0.4"/>
+            </pattern>
+            {/* FK arrow markers */}
+            <marker id="fk-arr" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto">
+              <polygon points="0 0,10 4,0 8" fill={T.muted}/>
+            </marker>
+            <marker id="fk-arr-s" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto">
+              <polygon points="0 0,10 4,0 8" fill={T.accent}/>
+            </marker>
+            <marker id="fk-crow" markerWidth="14" markerHeight="10" refX="2" refY="5" orient="auto">
+              <path d="M 12 0 L 2 5 L 12 10 M 14 0 L 14 10" stroke={T.muted} strokeWidth="1.5" fill="none"/>
+            </marker>
+          </defs>
+          <rect width="100%" height="100%" fill="url(#relcvgrid)" className="rcvbg"/>
+          <g transform={`translate(${pan.x},${pan.y})`}>
+            {/* FK arrows */}
+            {fkeys.map(fk=>{
+              const ft=tables.find(t=>t.id===fk.fromTable),tt=tables.find(t=>t.id===fk.toTable);
+              if(!ft||!tt) return null;
+              const fci=ft.cols.findIndex(c=>c.id===fk.fromCol);
+              const tci=tt.cols.findIndex(c=>c.id===fk.toCol);
+              const x1=tblCx(ft),y1=fci>=0?tblColCy(ft,fci):ft.y+tblH(ft)/2;
+              const x2=tblCx(tt),y2=tci>=0?tblColCy(tt,tci):tt.y+tblH(tt)/2;
+              const isSel=selected?.id===fk.id;
               return (
-                <g key={ent.id} transform={`translate(${ent.x},${ent.y})`}
-                  onMouseDown={e=>handleMouseDown(e,ent.id)}
-                  onMouseEnter={()=>setHoverEnt(ent.id)} onMouseLeave={()=>setHoverEnt(null)}
-                  style={{cursor:tool==="relation"?"pointer":"move"}}>
-                  <rect x={3} y={3} width={entW} height={h} rx={7} fill="rgba(0,0,0,.4)"/>
-                  <rect width={entW} height={h} rx={7} fill={T.surfaceAlt} stroke={bc} strokeWidth={isSel?2:1.5}/>
-                  <rect width={entW} height={28} rx={7} fill={isSel?T.accent:T.borderHi}/>
-                  <rect y={22} width={entW} height={6} fill={isSel?T.accent:T.borderHi}/>
-                  {editingLabel?.type==="entity"&&editingLabel.id===ent.id?(
-                    <foreignObject x={6} y={4} width={entW-12} height={22}>
-                      <input xmlns="http://www.w3.org/1999/xhtml"
-                        style={{width:"100%",background:"transparent",border:"none",outline:"none",color:isSel?T.bg:T.text,fontWeight:800,fontSize:12,fontFamily:"'Syne',sans-serif",textAlign:"center"}}
-                        defaultValue={ent.name} autoFocus
-                        onBlur={e=>{updateEntity(ent.id,"name",e.target.value);setEditingLabel(null);}}
-                        onKeyDown={e=>{if(e.key==="Enter"){updateEntity(ent.id,"name",e.target.value);setEditingLabel(null);}e.stopPropagation();}}
-                        onClick={e=>e.stopPropagation()}/>
-                    </foreignObject>
-                  ):(
-                    <text x={entW/2} y={18} textAnchor="middle" fontSize={12} fontWeight={800} fill={isSel?T.bg:T.text}
-                      fontFamily="'Syne',sans-serif" style={{pointerEvents:readOnly?"none":"all",cursor:"text"}}
-                      onDoubleClick={e=>{e.stopPropagation();if(!readOnly)setEditingLabel({type:"entity",id:ent.id});}}>
-                      {ent.name}
-                    </text>
-                  )}
-                  {ent.attributes.map((attr,ai)=>(
-                    <g key={attr.id} transform={`translate(0,${28+ai*22})`}>
-                      <line x1={0} y1={0} x2={entW} y2={0} stroke={T.border} strokeWidth={0.5}/>
-                      {attr.isPK&&<text x={6} y={15} fontSize={9} fill={T.yellow}>🔑</text>}
-                      {attr.isFK&&!attr.isPK&&<text x={6} y={15} fontSize={9} fill={T.orange}>🔗</text>}
-                      <text x={attr.isPK||attr.isFK?22:8} y={15} fontSize={10} fill={attr.isPK?T.yellow:T.text}
-                        fontFamily="'JetBrains Mono',monospace" fontWeight={attr.isPK?700:400}>{attr.name}</text>
-                      <text x={entW-6} y={15} textAnchor="end" fontSize={9} fill={T.muted} fontFamily="'JetBrains Mono',monospace">{attr.type.split("(")[0]}</text>
-                    </g>
-                  ))}
+                <g key={fk.id} onClick={e=>{e.stopPropagation();if(!readOnly)setSelected({type:'fk',id:fk.id});}}>
+                  <line x1={x1} y1={y1} x2={x2} y2={y2}
+                    stroke={isSel?T.accent:T.muted} strokeWidth={isSel?2:1.5}
+                    strokeDasharray="5 3"
+                    markerEnd={`url(#fk-arr${isSel?'-s':''})`}
+                    markerStart="url(#fk-crow)"
+                    style={{cursor:'pointer'}}/>
+                  <rect x={(x1+x2)/2-18} y={(y1+y2)/2-9} width={36} height={18} rx={4} fill={T.surfaceAlt} stroke={isSel?T.accent:T.border}/>
+                  <text x={(x1+x2)/2} y={(y1+y2)/2+1} textAnchor="middle" dominantBaseline="middle" fontSize={9} fill={isSel?T.accent:T.muted} fontFamily="'Syne',sans-serif" fontWeight={700} style={{pointerEvents:'none'}}>{fk.card||'N:1'}</text>
+                </g>
+              );
+            })}
+            {/* Tables */}
+            {tables.map(tbl=>{
+              const h=tblH(tbl);
+              const isTblSel=selected?.type==='table'&&selected.id===tbl.id;
+              const isHovTbl=hov===tbl.id&&tool==='fk'&&fkSrc&&fkSrc.tableId!==tbl.id;
+              return (
+                <g key={tbl.id} transform={`translate(${tbl.x},${tbl.y})`}
+                  style={{cursor:tool==='fk'?'pointer':'move'}}>
+                  {/* Shadow */}
+                  {!readOnly&&<rect x={3} y={3} width={TBL_W} height={h} rx={5} fill="rgba(0,0,0,.35)"/>}
+                  {/* Body */}
+                  <rect width={TBL_W} height={h} rx={5} fill={T.surfaceAlt}
+                    stroke={isHovTbl?T.green:isTblSel?T.accent:T.border} strokeWidth={isTblSel?2:1.5}
+                    onMouseDown={e=>handleTblDown(e,tbl.id)}/>
+                  {/* Header */}
+                  <rect width={TBL_W} height={HDR_H} rx={5} fill={isTblSel?T.accent:T.borderHi}
+                    onMouseDown={e=>handleTblDown(e,tbl.id)}/>
+                  <rect y={HDR_H-5} width={TBL_W} height={5} fill={isTblSel?T.accent:T.borderHi}/>
+                  <text x={TBL_W/2} y={HDR_H/2+1} textAnchor="middle" dominantBaseline="middle"
+                    fontSize={12} fontWeight={800} fill={isTblSel?T.bg:T.text}
+                    fontFamily="'Syne',sans-serif" style={{pointerEvents:'none',userSelect:'none'}}>
+                    {tbl.name}
+                  </text>
+                  {/* Columns */}
+                  {tbl.cols.map((col,ci)=>{
+                    const y=HDR_H+ci*COL_H;
+                    const isColSel=selected?.type==='col'&&selected.tableId===tbl.id&&selected.id===col.id;
+                    const isFkSrc2=fkSrc?.tableId===tbl.id&&fkSrc?.colId===col.id;
+                    return (
+                      <g key={col.id} transform={`translate(0,${y})`}
+                        onClick={e=>handleColClick(e,tbl.id,col.id)}
+                        style={{cursor:tool==='fk'?'crosshair':'default'}}>
+                        <rect width={TBL_W} height={COL_H} fill={isColSel||isFkSrc2?T.accentGlow:'transparent'} stroke={T.border} strokeWidth={0.5} style={{pointerEvents:'all'}}/>
+                        {col.pk&&<text x={6} y={COL_H/2+1} dominantBaseline="middle" fontSize={9} fill={T.yellow} fontWeight={800}>PK</text>}
+                        {col.fk&&!col.pk&&<text x={6} y={COL_H/2+1} dominantBaseline="middle" fontSize={9} fill={T.orange} fontWeight={800}>FK</text>}
+                        {col.pk&&col.fk&&<text x={6} y={COL_H/2+1} dominantBaseline="middle" fontSize={8} fill={T.orange}>PFK</text>}
+                        <text x={col.pk||col.fk?28:8} y={COL_H/2+1} dominantBaseline="middle"
+                          fontSize={10} fill={col.pk?T.yellow:col.fk?T.orange:T.text}
+                          fontFamily="'JetBrains Mono',monospace" fontWeight={col.pk?700:400}
+                          textDecoration={col.pk?'underline':'none'}
+                          style={{pointerEvents:'none',userSelect:'none'}}>
+                          {col.name}{col.nn&&!col.pk?'*':''}
+                        </text>
+                        <text x={TBL_W-5} y={COL_H/2+1} textAnchor="end" dominantBaseline="middle"
+                          fontSize={9} fill={T.muted} fontFamily="'JetBrains Mono',monospace"
+                          style={{pointerEvents:'none',userSelect:'none'}}>
+                          {col.type.split('(')[0]}
+                        </text>
+                      </g>
+                    );
+                  })}
                 </g>
               );
             })}
           </g>
         </svg>
-
         {/* Properties panel */}
-        {!readOnly&&(selEnt||selRel)&&(
-          <div style={{width:220,background:T.surface,borderLeft:`1px solid ${T.border}`,overflow:"auto",flexShrink:0,fontSize:11}}>
-            {selEnt&&(
-              <div style={{padding:10}}>
-                <div style={{fontWeight:700,fontSize:12,marginBottom:8,color:T.accent}}>📦 Entity</div>
-                <div className="fg"><label className="flabel">Name</label><input className="finput" style={{fontSize:11}} value={selEnt.name} onChange={e=>updateEntity(selEnt.id,"name",e.target.value)}/></div>
-                <div style={{fontSize:9,color:T.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:5}}>Attributes</div>
-                {selEnt.attributes.map(attr=>(
-                  <div key={attr.id} style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:5,padding:7,marginBottom:5}}>
-                    <div style={{display:"flex",gap:4,marginBottom:4}}>
-                      <input className="finput" style={{flex:1,fontSize:10}} value={attr.name} onChange={e=>updateAttr(selEnt.id,attr.id,"name",e.target.value)} placeholder="name"/>
-                      <button className="xbtn" onClick={()=>removeAttr(selEnt.id,attr.id)}>✕</button>
+        {!readOnly&&(selTbl||selCol||selFk)&&(
+          <div style={{width:210,background:T.surface,borderLeft:`1px solid ${T.border}`,overflow:'auto',flexShrink:0,fontSize:11,padding:10}}>
+            {selTbl&&(
+              <>
+                <div style={{fontWeight:700,fontSize:11,marginBottom:8,color:T.accent,textTransform:'uppercase'}}>Table</div>
+                <div className="fg"><label className="flabel">Name</label>
+                  <input className="finput" style={{fontSize:11}} value={selTbl.name} onChange={e=>updTbl(selTbl.id,'name',e.target.value)}/>
+                </div>
+                <div style={{fontSize:9,color:T.muted,textTransform:'uppercase',letterSpacing:1,marginBottom:5}}>Columns <span style={{color:T.dim,fontSize:8}}>(* = NOT NULL)</span></div>
+                {selTbl.cols.map(col=>(
+                  <div key={col.id} style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:5,padding:6,marginBottom:5}}>
+                    <div style={{display:'flex',gap:4,marginBottom:4}}>
+                      <input className="finput" style={{flex:1,fontSize:10}} value={col.name} onChange={e=>updCol(selTbl.id,col.id,'name',e.target.value)} placeholder="name"/>
+                      <button className="xbtn" onClick={()=>delCol(selTbl.id,col.id)}>✕</button>
                     </div>
-                    <select className="finput" style={{fontSize:10,marginBottom:4}} value={attr.type} onChange={e=>updateAttr(selEnt.id,attr.id,"type",e.target.value)}>
-                      {["INT","BIGINT","VARCHAR(50)","VARCHAR(100)","VARCHAR(255)","TEXT","DATE","DATETIME","DECIMAL(10,2)","BOOLEAN","FLOAT"].map(t=><option key={t} value={t}>{t}</option>)}
+                    <select className="finput" style={{fontSize:10,marginBottom:4}} value={col.type} onChange={e=>updCol(selTbl.id,col.id,'type',e.target.value)}>
+                      {SQL_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
                     </select>
-                    <div style={{display:"flex",gap:8}}>
-                      <label style={{display:"flex",gap:4,alignItems:"center",fontSize:10,cursor:"pointer",color:attr.isPK?T.yellow:T.muted}}><input type="checkbox" checked={attr.isPK} onChange={e=>updateAttr(selEnt.id,attr.id,"isPK",e.target.checked)}/> PK</label>
-                      <label style={{display:"flex",gap:4,alignItems:"center",fontSize:10,cursor:"pointer",color:attr.isFK?T.orange:T.muted}}><input type="checkbox" checked={attr.isFK} onChange={e=>updateAttr(selEnt.id,attr.id,"isFK",e.target.checked)}/> FK</label>
+                    <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                      <label style={{display:'flex',gap:3,alignItems:'center',fontSize:9,cursor:'pointer',color:col.pk?T.yellow:T.muted}}><input type="checkbox" checked={col.pk} onChange={e=>updCol(selTbl.id,col.id,'pk',e.target.checked)}/> PK</label>
+                      <label style={{display:'flex',gap:3,alignItems:'center',fontSize:9,cursor:'pointer',color:col.fk?T.orange:T.muted}}><input type="checkbox" checked={col.fk} onChange={e=>updCol(selTbl.id,col.id,'fk',e.target.checked)}/> FK</label>
+                      <label style={{display:'flex',gap:3,alignItems:'center',fontSize:9,cursor:'pointer',color:col.nn?T.teal:T.muted}}><input type="checkbox" checked={col.nn||false} onChange={e=>updCol(selTbl.id,col.id,'nn',e.target.checked)}/> NN</label>
                     </div>
                   </div>
                 ))}
-                <button className="btn btn-ghost btn-sm" style={{width:"100%",justifyContent:"center",marginTop:2}} onClick={()=>addAttr(selEnt.id)}>+ Attribute</button>
-              </div>
+                <button className="btn btn-ghost btn-sm" style={{width:'100%',justifyContent:'center',marginTop:2,fontSize:10}} onClick={()=>addCol(selTbl.id)}>+ Column</button>
+              </>
             )}
-            {selRel&&(
-              <div style={{padding:10}}>
-                <div style={{fontWeight:700,fontSize:12,marginBottom:8,color:T.accent}}>🔗 Relationship</div>
-                <div className="fg"><label className="flabel">Label</label><input className="finput" style={{fontSize:11}} value={selRel.label} onChange={e=>updateRelation(selRel.id,"label",e.target.value)}/></div>
+            {selCol&&(()=>{
+              const pt=tables.find(t=>t.cols.some(c=>c.id===selCol.id));
+              if(!pt) return null;
+              return (
+                <>
+                  <div style={{fontWeight:700,fontSize:11,marginBottom:8,color:T.accent,textTransform:'uppercase'}}>Column</div>
+                  <div className="fg"><label className="flabel">Name</label>
+                    <input className="finput" style={{fontSize:11}} value={selCol.name} onChange={e=>updCol(pt.id,selCol.id,'name',e.target.value)}/>
+                  </div>
+                  <div className="fg"><label className="flabel">Type</label>
+                    <select className="finput" style={{fontSize:10}} value={selCol.type} onChange={e=>updCol(pt.id,selCol.id,'type',e.target.value)}>
+                      {SQL_TYPES.map(t=><option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </div>
+                  <div style={{display:'flex',gap:8,flexWrap:'wrap',marginTop:4}}>
+                    <label style={{display:'flex',gap:3,alignItems:'center',fontSize:9,cursor:'pointer',color:selCol.pk?T.yellow:T.muted}}><input type="checkbox" checked={selCol.pk} onChange={e=>updCol(pt.id,selCol.id,'pk',e.target.checked)}/> PK</label>
+                    <label style={{display:'flex',gap:3,alignItems:'center',fontSize:9,cursor:'pointer',color:selCol.fk?T.orange:T.muted}}><input type="checkbox" checked={selCol.fk} onChange={e=>updCol(pt.id,selCol.id,'fk',e.target.checked)}/> FK</label>
+                    <label style={{display:'flex',gap:3,alignItems:'center',fontSize:9,cursor:'pointer',color:selCol.nn?T.teal:T.muted}}><input type="checkbox" checked={selCol.nn||false} onChange={e=>updCol(pt.id,selCol.id,'nn',e.target.checked)}/> NN</label>
+                  </div>
+                </>
+              );
+            })()}
+            {selFk&&(
+              <>
+                <div style={{fontWeight:700,fontSize:11,marginBottom:8,color:T.accent,textTransform:'uppercase'}}>FK Relationship</div>
                 <div className="fg"><label className="flabel">Cardinality</label>
-                  <div style={{display:"flex",gap:5}}>
-                    {["1:1","1:N","N:M"].map(c=><button key={c} className={`btn btn-sm ${selRel.cardinality===c?"btn-run":"btn-ghost"}`} onClick={()=>updateRelation(selRel.id,"cardinality",c)}>{c}</button>)}
+                  <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
+                    {['1:1','1:N','N:1','N:M'].map(c=>(
+                      <button key={c} className={`btn btn-sm ${selFk.card===c?'btn-run':'btn-ghost'}`}
+                        style={{fontSize:9}} onClick={()=>{const nf=fkeys.map(f=>f.id===selFk.id?{...f,card:c}:f);setFkeys(nf);emit(tables,nf);}}>
+                        {c}
+                      </button>
+                    ))}
                   </div>
                 </div>
-                <div style={{fontSize:10,color:T.muted}}>{entities.find(e=>e.id===selRel.from)?.name} → {entities.find(e=>e.id===selRel.to)?.name}</div>
-              </div>
+                <div style={{fontSize:10,color:T.muted,marginTop:4}}>
+                  {tables.find(t=>t.id===selFk.fromTable)?.name} → {tables.find(t=>t.id===selFk.toTable)?.name}
+                </div>
+              </>
             )}
           </div>
         )}
-        {readOnly&&entities.length>0&&(
-          <div style={{width:155,background:T.surface,borderLeft:`1px solid ${T.border}`,padding:10,overflow:"auto",flexShrink:0}}>
-            <div style={{fontSize:9,color:T.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:7}}>Entities</div>
-            {entities.map(e=>(
-              <div key={e.id} style={{marginBottom:7}}>
-                <div style={{fontSize:11,fontWeight:700,color:T.text,marginBottom:2}}>{e.name}</div>
-                {e.attributes.map(a=><div key={a.id} style={{fontSize:9,color:a.isPK?T.yellow:T.muted,fontFamily:"'JetBrains Mono',monospace",paddingLeft:6}}>{a.isPK?"🔑 ":a.isFK?"🔗 ":"• "}{a.name}</div>)}
+        {readOnly&&tables.length>0&&(
+          <div style={{width:140,background:T.surface,borderLeft:`1px solid ${T.border}`,padding:8,overflow:'auto',flexShrink:0}}>
+            <div style={{fontSize:9,color:T.muted,textTransform:'uppercase',letterSpacing:1,marginBottom:6}}>Tables</div>
+            {tables.map(t=>(
+              <div key={t.id} style={{marginBottom:7}}>
+                <div style={{fontSize:11,fontWeight:700,color:T.text,marginBottom:2}}>{t.name}</div>
+                {t.cols.map(c=><div key={c.id} style={{fontSize:9,color:c.pk?T.yellow:c.fk?T.orange:T.muted,fontFamily:"'JetBrains Mono',monospace",paddingLeft:6}}>{c.pk?'🔑':c.fk?'🔗':'·'} {c.name}</div>)}
               </div>
             ))}
-            <div style={{height:1,background:T.border,margin:"7px 0"}}/>
-            <div style={{fontSize:9,color:T.muted,textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>Relations</div>
-            {relations.map(r=>{ const f=entities.find(e=>e.id===r.from),t=entities.find(e=>e.id===r.to); return <div key={r.id} style={{fontSize:9,color:T.muted,marginBottom:3}}>{f?.name} <span style={{color:T.accent}}>{r.cardinality}</span> {t?.name}</div>; })}
           </div>
         )}
       </div>
@@ -1375,6 +1739,8 @@ function QuizBuilderModal({newQuiz,setNewQuiz,saveQuiz,onClose,classes}) {
   const addQ=(type)=>setNewQuiz(p=>({...p,questions:[...p.questions,
     type==="mcq"?{type:"mcq",prompt:"",options:["","","",""],correct:0,points:1}
     :type==="sql"?{type:"sql",prompt:"",points:2}
+    :type==="er_logical"?{type:"er_logical",prompt:"ER Diagram",scenario:"",requirements:[],hints:"",points:10}
+    :type==="er_physical"?{type:"er_physical",prompt:"Relational Model",scenario:"",requirements:[],hints:"",points:10}
     :{type:"scenario",prompt:"",scenario:"",requirements:[],hints:"",erPoints:5,sqlPoints:5}
   ]}));
   return (
@@ -1405,7 +1771,7 @@ function QuizBuilderModal({newQuiz,setNewQuiz,saveQuiz,onClose,classes}) {
             <div key={i} style={{background:T.surfaceAlt,border:`1px solid ${T.border}`,borderRadius:9,padding:"13px 15px",marginBottom:10}}>
               <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
                 <div className="q-num">{i+1}</div>
-                <span className={`badge ${qi.type==="mcq"?"b-marked":qi.type==="sql"?"b-partial":"b-scenario"}`}>{qi.type==="mcq"?"Multiple Choice":qi.type==="sql"?"SQL Query":"🗂 Scenario (ER + SQL)"}</span>
+                <span className={`badge ${qi.type==="mcq"?"b-marked":qi.type==="sql"?"b-partial":qi.type==="er_logical"?"b-scenario":qi.type==="er_physical"?"b-teal":"b-scenario"}`}>{qi.type==="mcq"?"Multiple Choice":qi.type==="sql"?"SQL Query":qi.type==="er_logical"?"🗂 ER Diagram":qi.type==="er_physical"?"🗃 Relational Model":"🗂 Scenario (ER + SQL)"}</span>
                 {newQuiz.questions.length>1&&<button className="btn btn-red btn-sm" style={{marginLeft:"auto"}} onClick={()=>setNewQuiz(p=>({...p,questions:p.questions.filter((_,j)=>j!==i)}))}>✕ Remove</button>}
               </div>
               {(qi.type==="mcq"||qi.type==="sql")&&(
@@ -1425,10 +1791,10 @@ function QuizBuilderModal({newQuiz,setNewQuiz,saveQuiz,onClose,classes}) {
                   ))}
                 </div>
               )}
-              {qi.type==="scenario"&&(
+              {(qi.type==="scenario"||qi.type==="er_logical"||qi.type==="er_physical")&&(
                 <div>
-                  <div className="fg"><label className="flabel">Question Title / Prompt</label><input className="finput" placeholder="e.g. Design a Hospital Database" value={qi.prompt||""} onChange={e=>updateQ(i,"prompt",e.target.value)}/></div>
-                  <div className="fg"><label className="flabel">Scenario Text</label><textarea className="finput" style={{minHeight:100}} placeholder="Describe the business scenario in detail…" value={qi.scenario||""} onChange={e=>updateQ(i,"scenario",e.target.value)}/></div>
+                  <div className="fg"><label className="flabel">Question Title / Prompt</label><input className="finput" placeholder={qi.type==="er_logical"?"e.g. Design a Logical ERD for a Hospital":qi.type==="er_physical"?"e.g. Design the Relational Model for a Hospital":"e.g. Design a Hospital Database"} value={qi.prompt||""} onChange={e=>updateQ(i,"prompt",e.target.value)}/></div>
+                  <div className="fg"><label className="flabel">Scenario / Description</label><textarea className="finput" style={{minHeight:90}} placeholder="Describe the scenario in detail…" value={qi.scenario||""} onChange={e=>updateQ(i,"scenario",e.target.value)}/></div>
                   <div className="fg">
                     <label className="flabel">Requirements</label>
                     {(qi.requirements||[]).map((req,ri)=>(
@@ -1439,12 +1805,19 @@ function QuizBuilderModal({newQuiz,setNewQuiz,saveQuiz,onClose,classes}) {
                     ))}
                     <button className="btn btn-ghost btn-sm" onClick={()=>addReq(i)}>+ Add Requirement</button>
                   </div>
-                  <div className="fg"><label className="flabel">Hint (optional)</label><input className="finput" placeholder="Optional hint shown to students…" value={qi.hints||""} onChange={e=>updateQ(i,"hints",e.target.value)}/></div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
-                    <div><label className="flabel">ER Points</label><input className="finput" type="number" min={0} max={100} value={qi.erPoints||5} onChange={e=>updateQ(i,"erPoints",Number(e.target.value)||5)}/></div>
-                    <div><label className="flabel">SQL Points</label><input className="finput" type="number" min={0} max={100} value={qi.sqlPoints||5} onChange={e=>updateQ(i,"sqlPoints",Number(e.target.value)||5)}/></div>
-                    <div><label className="flabel">Total</label><input className="finput" readOnly value={(qi.erPoints||5)+(qi.sqlPoints||5)} style={{color:T.muted}}/></div>
-                  </div>
+                  <div className="fg"><label className="flabel">Hint (optional)</label><input className="finput" placeholder="Optional hint…" value={qi.hints||""} onChange={e=>updateQ(i,"hints",e.target.value)}/></div>
+                  {qi.type==="scenario"&&(
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+                      <div><label className="flabel">ER Points</label><input className="finput" type="number" min={0} max={100} value={qi.erPoints||5} onChange={e=>updateQ(i,"erPoints",Number(e.target.value)||5)}/></div>
+                      <div><label className="flabel">SQL Points</label><input className="finput" type="number" min={0} max={100} value={qi.sqlPoints||5} onChange={e=>updateQ(i,"sqlPoints",Number(e.target.value)||5)}/></div>
+                      <div><label className="flabel">Total</label><input className="finput" readOnly value={(qi.erPoints||5)+(qi.sqlPoints||5)} style={{color:T.muted}}/></div>
+                    </div>
+                  )}
+                  {(qi.type==="er_logical"||qi.type==="er_physical")&&(
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                      <div><label className="flabel">Points</label><input className="finput" type="number" min={1} max={100} value={qi.points||10} onChange={e=>updateQ(i,"points",Number(e.target.value)||10)}/></div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -1452,7 +1825,9 @@ function QuizBuilderModal({newQuiz,setNewQuiz,saveQuiz,onClose,classes}) {
           <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
             <button className="btn btn-ghost btn-sm" onClick={()=>addQ("mcq")}>+ Multiple Choice</button>
             <button className="btn btn-ghost btn-sm" onClick={()=>addQ("sql")}>+ SQL Question</button>
-            <button className="btn btn-teal btn-sm" onClick={()=>addQ("scenario")}>+ 🗂 Scenario (ER + SQL)</button>
+            <button className="btn btn-teal btn-sm" onClick={()=>addQ("er_logical")}>+ 🗂 ER Diagram</button>
+            <button className="btn btn-teal btn-sm" onClick={()=>addQ("er_physical")}>+ 🗃 Relational Model</button>
+            <button className="btn btn-ghost btn-sm" style={{fontSize:10,opacity:0.7}} onClick={()=>addQ("scenario")}>+ Scenario (ER+SQL)</button>
           </div>
         </div>
         <div className="mftr">
@@ -1473,11 +1848,12 @@ function MarkingModal({markingQuiz,quizSubs,quizStudents,markScores,setMarkScore
   const st=quizStudents.find(s=>s.id===studentId);
   useEffect(()=>{store.get(QUIZ_PFX+quizId,true).then(setQuiz);},[quizId]);
   if(!quiz||!sub) return <div className="overlay"><div className="modal"><div className="mbody"><div className="empty"><div className="empty-ico">⏳</div>Loading…</div></div></div></div>;
-  const totalPts=quiz.questions.reduce((s,q)=>s+(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):q.points),0);
+  const totalPts=quiz.questions.reduce((s,q)=>s+((q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.type==="er_logical"||q.type==="er_physical")?(q.points||10):q.points)),0);
   const currentTotal=quiz.questions.reduce((s,q,i)=>{
     if(q.type==="mcq"){const auto=sub.answers[i]===q.correct?q.points:0;return s+(markScores[`${i}_mcq`]!==undefined?Number(markScores[`${i}_mcq`]):auto);}
     if(q.type==="sql") return s+(markScores[`${i}_sql`]!==undefined?Number(markScores[`${i}_sql`]):0);
     if(q.type==="scenario") return s+(markScores[`${i}_er`]!==undefined?Number(markScores[`${i}_er`]):0)+(markScores[`${i}_sql`]!==undefined?Number(markScores[`${i}_sql`]):0);
+    if(q.type==="er_logical"||q.type==="er_physical") return s+(markScores[`${i}_er`]!==undefined?Number(markScores[`${i}_er`]):0);
     return s;
   },0);
   return (
@@ -1497,7 +1873,7 @@ function MarkingModal({markingQuiz,quizSubs,quizStudents,markScores,setMarkScore
                 <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:8}}>
                   <div className="q-num">{i+1}</div>
                   <span style={{fontSize:12,fontWeight:700}}>{qi.prompt}</span>
-                  <span className={`badge ${qi.type==="mcq"?"b-marked":qi.type==="sql"?"b-partial":"b-scenario"}`}>{qi.type==="mcq"?"MCQ":qi.type==="sql"?"SQL":"🗂 Scenario"}</span>
+                  <span className={`badge ${qi.type==="mcq"?"b-marked":qi.type==="sql"?"b-partial":qi.type==="er_logical"?"b-scenario":qi.type==="er_physical"?"b-teal":"b-scenario"}`}>{qi.type==="mcq"?"MCQ":qi.type==="sql"?"SQL":qi.type==="er_logical"?"🗂 ER Diagram":qi.type==="er_physical"?"🗃 Relational Model":"🗂 Scenario"}</span>
                 </div>
                 {qi.type==="mcq"&&(
                   <div>
@@ -1542,6 +1918,22 @@ function MarkingModal({markingQuiz,quizSubs,quizStudents,markScores,setMarkScore
                     )}
                   </div>
                 )}
+                {(qi.type==="er_logical"||qi.type==="er_physical")&&(
+                  <div>
+                    <div style={{fontSize:10,color:T.muted,marginBottom:5}}>Student's {qi.type==="er_logical"?"Logical ERD":"Relational Model"}</div>
+                    <div style={{height:300,border:`1px solid ${T.border}`,borderRadius:8,overflow:"hidden"}}>
+                      {qi.type==="er_logical"
+                        ?(sub.answers[i]?.nodes?.length>0||sub.answers[i]?.entities?.length>0
+                          ?<ERCanvas value={sub.answers[i]} onChange={()=>{}} readOnly={true}/>
+                          :<div className="empty" style={{height:"100%",display:"flex",alignItems:"center",justifyContent:"center"}}><div><div className="empty-ico">📭</div><div>No diagram submitted</div></div></div>)
+                        :(sub.answers[i]?.tables?.length>0
+                          ?<RelationalCanvas value={sub.answers[i]} onChange={()=>{}} readOnly={true}/>
+                          :<div className="empty" style={{height:"100%",display:"flex",alignItems:"center",justifyContent:"center"}}><div><div className="empty-ico">📭</div><div>No diagram submitted</div></div></div>)
+                      }
+                    </div>
+                    <input className="feedback-input" placeholder={`${qi.type==="er_logical"?"ER Diagram":"Relational Model"} feedback…`} value={markFeedback[`${i}_er`]||""} onChange={e=>setMarkFeedback(p=>({...p,[`${i}_er`]:e.target.value}))}/>
+                  </div>
+                )}
               </div>
               <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:5,paddingTop:2,flexShrink:0}}>
                 {qi.type==="scenario"?(
@@ -1549,6 +1941,8 @@ function MarkingModal({markingQuiz,quizSubs,quizStudents,markScores,setMarkScore
                     <div style={{textAlign:"center"}}><div style={{fontSize:8,color:T.teal,textTransform:"uppercase",marginBottom:3}}>ER</div><input className="score-input" type="number" min={0} max={qi.erPoints||5} value={markScores[`${i}_er`]!==undefined?markScores[`${i}_er`]:0} onChange={e=>setMarkScores(p=>({...p,[`${i}_er`]:e.target.value}))}/><div style={{fontSize:8,color:T.dim}}>/{qi.erPoints||5}</div></div>
                     <div style={{textAlign:"center"}}><div style={{fontSize:8,color:T.orange,textTransform:"uppercase",marginBottom:3}}>SQL</div><input className="score-input" type="number" min={0} max={qi.sqlPoints||5} value={markScores[`${i}_sql`]!==undefined?markScores[`${i}_sql`]:0} onChange={e=>setMarkScores(p=>({...p,[`${i}_sql`]:e.target.value}))}/><div style={{fontSize:8,color:T.dim}}>/{qi.sqlPoints||5}</div></div>
                   </div>
+                ):qi.type==="er_logical"||qi.type==="er_physical"?(
+                  <div style={{textAlign:"center"}}><div style={{fontSize:8,color:T.teal,textTransform:"uppercase",marginBottom:3}}>Score</div><input className="score-input" type="number" min={0} max={qi.points||10} value={markScores[`${i}_er`]!==undefined?markScores[`${i}_er`]:0} onChange={e=>setMarkScores(p=>({...p,[`${i}_er`]:e.target.value}))}/><div style={{fontSize:8,color:T.dim}}>/{qi.points||10}</div></div>
                 ):(
                   <div style={{textAlign:"center"}}><div style={{fontSize:8,color:T.muted,textTransform:"uppercase",marginBottom:3}}>Score</div><input className="score-input" type="number" min={0} max={qi.points} value={markScores[`${i}_${qi.type}`]!==undefined?markScores[`${i}_${qi.type}`]:(qi.type==="mcq"&&sub.answers[i]===qi.correct?qi.points:0)} onChange={e=>setMarkScores(p=>({...p,[`${i}_${qi.type}`]:e.target.value}))}/><div style={{fontSize:8,color:T.dim}}>/{qi.points}</div></div>
                 )}
@@ -1575,11 +1969,13 @@ function StudentQuizTaker({curQuiz,qReg,quizSubs,qAnswers,setQAnswers,selQIdx,se
   const isSubmitted=!!sub;
   const isExpired=timerInfo?.expired&&!isSubmitted;
   const qi=curQuiz.questions[selQIdx];
-  const totalPts=curQuiz.questions.reduce((s,q)=>s+(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):q.points),0);
+  const totalPts=curQuiz.questions.reduce((s,q)=>s+((q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.type==="er_logical"||q.type==="er_physical")?(q.points||10):q.points)),0);
   const allAnswered=curQuiz.questions.every((q,i)=>{
     if(q.type==="mcq") return qAnswers[i]!==undefined;
     if(q.type==="sql") return qAnswers[i]?.trim?.()?.length>0;
     if(q.type==="scenario") return qAnswers[i]?.sql?.trim?.()?.length>0||qAnswers[i]?.er?.entities?.length>0;
+    if(q.type==="er_logical") return qAnswers[i]?.nodes?.length>0;
+    if(q.type==="er_physical") return qAnswers[i]?.tables?.length>0;
     return true;
   });
 
@@ -1614,8 +2010,8 @@ function StudentQuizTaker({curQuiz,qReg,quizSubs,qAnswers,setQAnswers,selQIdx,se
         <div style={{padding:"8px 14px",background:T.surface,borderBottom:`1px solid ${T.border}`,display:"flex",gap:5,flexWrap:"wrap",alignItems:"center",flexShrink:0}}>
           <span style={{fontSize:9,color:T.muted,marginRight:4,fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>Q:</span>
           {curQuiz.questions.map((q,i)=>{
-            const hasAns=q.type==="mcq"?(isSubmitted?sub.answers[i]!==undefined:qAnswers[i]!==undefined):q.type==="scenario"?(qAnswers[i]?.sql?.trim?.()?.length>0||qAnswers[i]?.er?.entities?.length>0):(isSubmitted?sub.answers[i]?.trim?.()?.length>0:qAnswers[i]?.trim?.()?.length>0);
-            const icon=q.type==="scenario"?"🗂":q.type==="sql"?"💻":"";
+            const hasAns=q.type==="mcq"?(isSubmitted?sub.answers[i]!==undefined:qAnswers[i]!==undefined):q.type==="scenario"?(qAnswers[i]?.sql?.trim?.()?.length>0||qAnswers[i]?.er?.entities?.length>0):q.type==="er_logical"?qAnswers[i]?.nodes?.length>0:q.type==="er_physical"?qAnswers[i]?.tables?.length>0:(isSubmitted?sub.answers[i]?.trim?.()?.length>0:qAnswers[i]?.trim?.()?.length>0);
+            const icon=q.type==="scenario"?"🗂":q.type==="er_logical"?"🗂":q.type==="er_physical"?"🗃":q.type==="sql"?"💻":"";
             return <div key={i} className={`mq-pip ${hasAns?"pip-done":i===selQIdx?"pip-active":"pip-pend"}`} onClick={()=>setSelQIdx(i)} title={q.type}>{icon||i+1}</div>;
           })}
         </div>
@@ -1675,6 +2071,40 @@ function StudentQuizTaker({curQuiz,qReg,quizSubs,qAnswers,setQAnswers,selQIdx,se
               )}
             </div>
           )}
+          {(qi?.type==="er_logical"||qi?.type==="er_physical")&&(
+            <div style={{flex:1,overflow:"hidden",display:"flex",flexDirection:"column"}}>
+              {/* Scenario / requirements header */}
+              {(qi.scenario||qi.requirements?.length>0)&&(
+                <div style={{flexShrink:0,overflow:"auto",maxHeight:160,padding:"10px 14px",background:T.surface,borderBottom:`1px solid ${T.border}`}}>
+                  <div style={{fontSize:9,fontWeight:700,textTransform:"uppercase",letterSpacing:1,color:qi.type==="er_logical"?T.teal:T.purple,marginBottom:6}}>
+                    {qi.type==="er_logical"?"🗂 ER Diagram":"🗃 Relational Model"} · Q{selQIdx+1} · {(qi.points||10)}pt{(qi.points||10)!==1?"s":""}
+                  </div>
+                  <div style={{fontSize:13,fontWeight:600,lineHeight:1.6,marginBottom:6}}>{qi.prompt}</div>
+                  {qi.scenario&&<div style={{fontSize:12,color:T.muted,lineHeight:1.6,whiteSpace:"pre-wrap",marginBottom:6}}>{qi.scenario}</div>}
+                  {qi.requirements?.length>0&&(
+                    <ol style={{paddingLeft:18,fontSize:11,color:T.text,lineHeight:1.8}}>
+                      {qi.requirements.map((r,ri)=><li key={ri}>{r}</li>)}
+                    </ol>
+                  )}
+                  {qi.hints&&<div style={{marginTop:6,padding:"5px 10px",background:`rgba(79,195,247,.06)`,border:`1px solid ${T.borderHi}`,borderRadius:6,fontSize:11,color:T.muted}}>💡 {qi.hints}</div>}
+                </div>
+              )}
+              <div style={{flex:1,overflow:"hidden"}}>
+                {qi.type==="er_logical"
+                  ?<ERCanvas key={selQIdx} value={isSubmitted?sub.answers[selQIdx]:(qAnswers[selQIdx]||{})} onChange={val=>!isSubmitted&&setQAnswers(p=>({...p,[selQIdx]:val}))} readOnly={isSubmitted}/>
+                  :<RelationalCanvas key={selQIdx} value={isSubmitted?sub.answers[selQIdx]:(qAnswers[selQIdx]||{})} onChange={val=>!isSubmitted&&setQAnswers(p=>({...p,[selQIdx]:val}))} readOnly={isSubmitted}/>
+                }
+              </div>
+              {isSubmitted&&sub?.feedback?.[`${selQIdx}_er`]&&<div style={{padding:"6px 14px",background:T.surface,borderTop:`1px solid ${T.border}`,fontSize:11,color:T.purple,flexShrink:0}}>💬 {sub.feedback[`${selQIdx}_er`]}</div>}
+              {!isSubmitted&&(
+                <div style={{padding:"8px 14px",background:T.surface,borderTop:`1px solid ${T.border}`,display:"flex",justifyContent:"space-between",flexShrink:0}}>
+                  <button className="btn btn-ghost btn-sm" disabled={selQIdx===0} onClick={()=>setSelQIdx(i=>i-1)}>← Prev</button>
+                  {selQIdx<curQuiz.questions.length-1?<button className="btn btn-run btn-sm" onClick={()=>setSelQIdx(i=>i+1)}>Next →</button>
+                    :<button className="btn btn-green btn-sm" disabled={!allAnswered} onClick={submitQuiz}>Submit Quiz ✓</button>}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
       <div className="rpanel">
@@ -1702,8 +2132,8 @@ function StudentQuizTaker({curQuiz,qReg,quizSubs,qAnswers,setQAnswers,selQIdx,se
             </div>
           )}
           {curQuiz.questions.map((q,i)=>{
-            const hasAns=isSubmitted?true:q.type==="mcq"?qAnswers[i]!==undefined:q.type==="scenario"?(qAnswers[i]?.sql?.trim?.()?.length>0||qAnswers[i]?.er?.entities?.length>0):qAnswers[i]?.trim?.()?.length>0;
-            const icon=q.type==="scenario"?"🗂":q.type==="sql"?"💻":"●";
+            const hasAns=isSubmitted?true:q.type==="mcq"?qAnswers[i]!==undefined:q.type==="scenario"?(qAnswers[i]?.sql?.trim?.()?.length>0||qAnswers[i]?.er?.entities?.length>0):q.type==="er_logical"?qAnswers[i]?.nodes?.length>0:q.type==="er_physical"?qAnswers[i]?.tables?.length>0:qAnswers[i]?.trim?.()?.length>0;
+            const icon=q.type==="scenario"?"🗂":q.type==="er_logical"?"🗂":q.type==="er_physical"?"🗃":q.type==="sql"?"💻":"●";
             return (
               <div key={i} onClick={()=>setSelQIdx(i)} style={{padding:"6px 8px",borderRadius:6,background:i===selQIdx?T.accentGlow:"transparent",border:`1px solid ${i===selQIdx?T.borderHi:"transparent"}`,cursor:"pointer",marginBottom:3}}>
                 <div style={{display:"flex",alignItems:"center",gap:5}}>
@@ -2789,6 +3219,151 @@ function LoginScreen({classes, onLoginTeacher, onLoginStudent, onRegisterStudent
   );
 }
 
+// ─── Students Modal Component ─────────────────────────────────────────────────
+function StudentsModal({students, classes, onClose, resetStudentPassword, deleteStudent, createStudentAccount, setStudents}) {
+  const SCOLS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4"];
+  const [resetTarget,setResetTarget]=useState(null);
+  const [newPass,setNewPass]=useState("");
+  const [showAdd,setShowAdd]=useState(false);
+  const [addName,setAddName]=useState("");
+  const [addPass,setAddPass]=useState("");
+  const [addClassId,setAddClassId]=useState(classes[0]?.id||"");
+  const [addColor,setAddColor]=useState("#4fc3f7");
+  const [addErr,setAddErr]=useState("");
+  const [filterClass,setFilterClass]=useState("all");
+
+  function exportStudentsExcel(){
+    try {
+      const rows=[["Name","Class","Joined","Colour"]];
+      students.forEach(s=>{
+        const cls=classes.find(c=>c.id===s.classId);
+        rows.push([s.name,cls?cls.name:"—",new Date(s.created).toLocaleDateString(),s.color]);
+      });
+      const ws=XLSX.utils.aoa_to_sheet(rows);
+      ws["!cols"]=[{wch:24},{wch:18},{wch:14},{wch:10}];
+      const wb=XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb,"Students",ws);
+      const b64=XLSX.write(wb,{bookType:"xlsx",type:"base64"});
+      const a=document.createElement("a");
+      a.href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"+b64;
+      a.download="students.xlsx"; a.click();
+    } catch(e){ alert("Export failed: "+e.message); }
+  }
+
+  function handleAddStudent(){
+    setAddErr("");
+    if(!addName.trim()||!addPass.trim()||!addClassId){setAddErr("Fill in all fields");return;}
+    if(addPass.length<3){setAddErr("Password must be at least 3 characters");return;}
+    const res=createStudentAccount(addName.trim(),addPass,addClassId,addColor);
+    if(res==="exists"){setAddErr("A student with that name already exists");return;}
+    setAddName(""); setAddPass(""); setAddErr(""); setShowAdd(false);
+    setStudents(LS.get("__shared__"+STUDENTS_KEY)||[]);
+  }
+
+  const visibleStuds=filterClass==="all"?students:students.filter(s=>s.classId===filterClass);
+
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="modal modal-lg" onClick={e=>e.stopPropagation()} style={{maxWidth:600,display:"flex",flexDirection:"column",maxHeight:"88vh"}}>
+        <div className="mhdr">
+          <span>👥 Student Accounts</span>
+          <div style={{display:"flex",gap:6,marginLeft:"auto",marginRight:8}}>
+            <button className="btn btn-green btn-sm" onClick={exportStudentsExcel}>📥 Export Excel</button>
+            <button className="btn btn-run btn-sm" onClick={()=>{setShowAdd(!showAdd);setAddErr("");}}>
+              {showAdd?"✕ Cancel":"+ Add Student"}
+            </button>
+          </div>
+          <button className="xbtn" onClick={onClose}>✕</button>
+        </div>
+
+        {showAdd&&(
+          <div style={{padding:"16px 20px",borderBottom:"1px solid #1e2d3d",background:"#0a1628"}}>
+            <div style={{fontSize:10,fontWeight:700,color:"#4fc3f7",textTransform:"uppercase",letterSpacing:1,marginBottom:12}}>New Student</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+              <div>
+                <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Full Name</label>
+                <input value={addName} onChange={e=>setAddName(e.target.value)} placeholder="e.g. Alice Johnson" autoFocus
+                  style={{width:"100%",padding:"8px 10px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:6,color:"#d6e4f0",fontSize:12,boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Password</label>
+                <input type="password" value={addPass} onChange={e=>setAddPass(e.target.value)} placeholder="••••••"
+                  style={{width:"100%",padding:"8px 10px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:6,color:"#d6e4f0",fontSize:12,boxSizing:"border-box"}}/>
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10,alignItems:"end"}}>
+              <div>
+                <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Class</label>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {classes.map(c=>(
+                    <div key={c.id} onClick={()=>setAddClassId(c.id)} style={{padding:"5px 12px",borderRadius:99,border:`2px solid ${addClassId===c.id?c.color:"#1e2d3d"}`,background:addClassId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:addClassId===c.id?c.color:"#3d5a73",transition:"all .15s"}}>
+                      {c.name}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Colour</label>
+                <div style={{display:"flex",gap:5}}>
+                  {SCOLS.map(c=><div key={c} onClick={()=>setAddColor(c)} style={{width:18,height:18,borderRadius:"50%",background:c,cursor:"pointer",border:addColor===c?"2px solid white":"2px solid transparent",boxShadow:addColor===c?`0 0 0 1px ${c}`:"none"}}/>)}
+                </div>
+              </div>
+            </div>
+            {addErr&&<div style={{marginTop:8,fontSize:11,color:"#ff5370"}}>{addErr}</div>}
+            <button className="btn btn-run btn-sm" style={{marginTop:12}} onClick={handleAddStudent}>Create Account</button>
+          </div>
+        )}
+
+        {classes.length>1&&(
+          <div style={{display:"flex",gap:6,padding:"10px 20px 0",flexWrap:"wrap"}}>
+            <div onClick={()=>setFilterClass("all")} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass==="all"?"#4fc3f7":"#1e2d3d"}`,background:filterClass==="all"?"#4fc3f722":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass==="all"?"#4fc3f7":"#3d5a73"}}>All</div>
+            {classes.map(c=><div key={c.id} onClick={()=>setFilterClass(c.id)} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass===c.id?c.color:"#1e2d3d"}`,background:filterClass===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass===c.id?c.color:"#3d5a73"}}>{c.name}</div>)}
+          </div>
+        )}
+
+        <div className="mbody" style={{flex:1,overflowY:"auto"}}>
+          {visibleStuds.length===0
+            ?<div className="empty"><div className="empty-ico">👥</div><div>{students.length===0?"No students yet — add one above or have them register":"No students in this class"}</div></div>
+            :visibleStuds.map(stu=>{
+              const cls=classes.find(c=>c.id===stu.classId);
+              const pts=(LS.get("__shared__"+POINTS_KEY)||{})[stu.sessionId];
+              return (
+                <div key={stu.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 12px",borderRadius:8,background:"#0d1b2a",border:"1px solid #1e2d3d",marginBottom:8}}>
+                  <div style={{width:34,height:34,borderRadius:"50%",background:stu.color+"33",border:`2px solid ${stu.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>👨‍💻</div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:13,fontWeight:700,color:"#d6e4f0"}}>{stu.name}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}>
+                      {cls&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:99,background:cls.color+"22",color:cls.color,fontWeight:700,border:`1px solid ${cls.color}44`}}>{cls.name}</span>}
+                      <span style={{fontSize:9,color:"#3d5a73"}}>{new Date(stu.created).toLocaleDateString()}</span>
+                      {pts&&<span style={{fontSize:9,color:"#ffd700",background:"#ffd70015",padding:"1px 6px",borderRadius:99,fontWeight:700,border:"1px solid #ffd70030"}}>{pts.total||0} pts</span>}
+                    </div>
+                  </div>
+                  {resetTarget===stu.id?(
+                    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                      <input placeholder="New password" value={newPass} onChange={e=>setNewPass(e.target.value)}
+                        style={{padding:"5px 8px",background:"#0a1628",border:"1px solid #1e2d3d",borderRadius:5,color:"#d6e4f0",fontSize:11,width:120}}/>
+                      <button className="btn btn-green btn-sm" onClick={()=>{if(newPass.length>=3){resetStudentPassword(stu.id,newPass);setResetTarget(null);setNewPass("");}}} style={{padding:"5px 10px"}}>Save</button>
+                      <button className="btn btn-ghost btn-sm" onClick={()=>{setResetTarget(null);setNewPass("");}} style={{padding:"5px 10px"}}>✕</button>
+                    </div>
+                  ):(
+                    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                      <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>setResetTarget(stu.id)}>🔑 Reset pw</button>
+                      <button className="btn btn-ghost btn-sm" style={{fontSize:10,color:"#ff5370",borderColor:"#ff537044"}} onClick={()=>deleteStudent(stu.id)}>🗑 Delete</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          }
+        </div>
+        <div className="mftr" style={{fontSize:10,color:"#3d5a73"}}>
+          {visibleStuds.length} of {students.length} student{students.length!==1?"s":""}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 function App() {
   const [sqlJS,setSqlJS]=useState(null);
@@ -2832,6 +3407,7 @@ function App() {
   const [markScores,setMarkScores]=useState({});
   const [markFeedback,setMarkFeedback]=useState({});
   const [newQuiz,setNewQuiz]=useState(null);
+  const [confirmDeleteQuizId,setConfirmDeleteQuizId]=useState(null); // quiz pending deletion
   const pollRef=useRef(null);
   // Classes
   const [classes,setClasses]=useState([]);
@@ -2998,81 +3574,180 @@ function App() {
     return all[quizId] || null;
   }
 
-  // ── Render an ER diagram to a PNG base64 string via offscreen canvas ──────
-  function renderERtoPNG(erData, width=700, height=420) {
+  // ── Render Logical ERD (node-based) to PNG ──────────────────────────────────
+  function renderERtoPNG(erData, width=700, height=480) {
     return new Promise(resolve => {
       try {
-        const { entities=[], relations=[] } = erData || {};
-        if (!entities.length) { resolve(null); return; }
+        // Support both old format (entities/relations) and new (nodes/edges)
+        let nodes = erData?.nodes || [];
+        let edges = erData?.edges || [];
+        // Backward compat: old entities format
+        if(!nodes.length && erData?.entities?.length) {
+          nodes = erData.entities.map(e=>({id:e.id,kind:'entity',label:e.name,x:e.x,y:e.y}));
+          edges = (erData.relations||[]).map(r=>({id:r.id,from:r.from,to:r.to,card:r.cardinality||''}));
+        }
+        if (!nodes.length) { resolve(null); return; }
+
         const canvas = document.createElement("canvas");
         canvas.width = width; canvas.height = height;
         const ctx = canvas.getContext("2d");
-
-        ctx.fillStyle = "#0d1117";
-        ctx.fillRect(0, 0, width, height);
+        ctx.fillStyle = "#0d1117"; ctx.fillRect(0, 0, width, height);
+        // Grid dots
         ctx.fillStyle = "#1e2d3d";
         for (let x=0; x<width; x+=24) for (let y=0; y<height; y+=24) ctx.fillRect(x,y,1,1);
 
-        const ENT_W=148, ENT_HDR=28, ROW_H=22;
-        const entH = e => ENT_HDR + e.attributes.length*ROW_H;
-
-        // Auto-layout if all at 0,0
-        const allZero = entities.every(e=>!e.x&&!e.y);
-        const positioned = entities.map((e,i)=>{
-          if(allZero){const cols=Math.ceil(Math.sqrt(entities.length)),col=i%cols,row=Math.floor(i/cols);return{...e,x:20+col*190,y:20+row*170};}
-          return e;
+        // Auto-layout if all zero
+        const allZero = nodes.every(n=>!n.x&&!n.y);
+        const cols = Math.ceil(Math.sqrt(nodes.length));
+        const laid = nodes.map((n,i)=>{
+          if(allZero){const col=i%cols,row=Math.floor(i/cols);return{...n,x:30+col*200,y:30+row*120};}
+          return n;
         });
 
-        // Relations
-        relations.forEach(r=>{
-          const f=positioned.find(e=>e.id===r.from),t=positioned.find(e=>e.id===r.to);
-          if(!f||!t) return;
-          const fx=f.x+ENT_W/2,fy=f.y+entH(f)/2,tx=t.x+ENT_W/2,ty=t.y+entH(t)/2;
-          ctx.beginPath(); ctx.moveTo(fx,fy); ctx.lineTo(tx,ty);
-          ctx.strokeStyle="#2d4a66"; ctx.lineWidth=1.5;
-          r.cardinality==="N:M"?ctx.setLineDash([6,3]):ctx.setLineDash([]);
-          ctx.stroke(); ctx.setLineDash([]);
-          const mx=(fx+tx)/2,my=(fy+ty)/2;
-          ctx.fillStyle="#111720"; ctx.fillRect(mx-22,my-10,44,20);
-          ctx.strokeStyle="#4fc3f7"; ctx.lineWidth=1; ctx.strokeRect(mx-22,my-10,44,20);
-          ctx.fillStyle="#4fc3f7"; ctx.font="bold 10px monospace";
-          ctx.textAlign="center"; ctx.textBaseline="middle";
-          ctx.fillText(r.cardinality||"",mx,my);
+        const W=(n)=>n.kind==='relationship'||n.kind==='weak_rel'?120:n.kind?.includes('attr')||n.kind==='key_attr'?110:140;
+        const H=(n)=>n.kind==='relationship'||n.kind==='weak_rel'?44:n.kind?.includes('attr')||n.kind==='key_attr'?34:38;
+        const cx=(n)=>n.x+W(n)/2, cy=(n)=>n.y+H(n)/2;
+
+        // Draw edges
+        edges.forEach(ed=>{
+          const fn=laid.find(n=>n.id===ed.from),tn=laid.find(n=>n.id===ed.to);
+          if(!fn||!tn) return;
+          ctx.beginPath(); ctx.moveTo(cx(fn),cy(fn)); ctx.lineTo(cx(tn),cy(tn));
+          ctx.strokeStyle="#2d4a66"; ctx.lineWidth=1.5; ctx.setLineDash([]); ctx.stroke();
+          if(ed.card||ed.label){
+            const mx=(cx(fn)+cx(tn))/2, my=(cy(fn)+cy(tn))/2;
+            ctx.fillStyle="#111720"; ctx.fillRect(mx-20,my-9,40,18);
+            ctx.strokeStyle="#4fc3f7"; ctx.lineWidth=1; ctx.strokeRect(mx-20,my-9,40,18);
+            ctx.fillStyle="#4fc3f7"; ctx.font="bold 9px monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
+            ctx.fillText(ed.card||ed.label,mx,my);
+          }
         });
 
-        // Entities
-        positioned.forEach(ent=>{
-          const h=entH(ent);
-          ctx.fillStyle="rgba(0,0,0,.4)";
-          if(ctx.roundRect){ctx.beginPath();ctx.roundRect(ent.x+3,ent.y+3,ENT_W,h,7);ctx.fill();}
+        // Draw nodes
+        laid.forEach(nd=>{
+          const w=W(nd),h=H(nd),x=nd.x,y=nd.y;
+          ctx.fillStyle="#d6e4f0"; ctx.font="bold 11px Arial,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+          const kind=nd.kind||'entity';
+          if(kind==='entity'){
+            ctx.fillStyle="#181f2a"; ctx.strokeStyle="#2d4a66"; ctx.lineWidth=1.5;
+            ctx.fillRect(x,y,w,h); ctx.strokeRect(x,y,w,h);
+            ctx.fillStyle="#d6e4f0"; ctx.fillText(nd.label,x+w/2,y+h/2);
+          } else if(kind==='weak_entity'){
+            ctx.fillStyle="#181f2a"; ctx.strokeStyle="#4fc3f7"; ctx.lineWidth=1.5;
+            ctx.fillRect(x,y,w,h); ctx.strokeRect(x,y,w,h);
+            ctx.strokeRect(x+4,y+4,w-8,h-8);
+            ctx.fillStyle="#d6e4f0"; ctx.fillText(nd.label,x+w/2,y+h/2);
+          } else if(kind==='relationship'||kind==='weak_rel'){
+            const hx=x+w/2,hy=y+h/2;
+            ctx.fillStyle="#0d1117"; ctx.strokeStyle="#c3e88d"; ctx.lineWidth=1.5;
+            ctx.beginPath(); ctx.moveTo(hx,y); ctx.lineTo(x+w,hy); ctx.lineTo(hx,y+h); ctx.lineTo(x,hy); ctx.closePath();
+            ctx.fill(); ctx.stroke();
+            if(kind==='weak_rel'){ctx.beginPath();ctx.moveTo(hx,y+5);ctx.lineTo(x+w-5,hy);ctx.lineTo(hx,y+h-5);ctx.lineTo(x+5,hy);ctx.closePath();ctx.stroke();}
+            ctx.fillStyle="#c3e88d"; ctx.fillText(nd.label,hx,hy);
+          } else if(kind?.includes('attr')||kind==='key_attr'){
+            const rx=w/2,ry=h/2;
+            ctx.fillStyle="#0d1117"; ctx.strokeStyle="#f78c6c"; ctx.lineWidth=1.5;
+            if(kind==='derived_attr'){ctx.setLineDash([5,3]);}
+            ctx.beginPath(); ctx.ellipse(x+rx,y+ry,rx,ry,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+            ctx.setLineDash([]);
+            if(kind==='multi_attr'){ctx.beginPath();ctx.ellipse(x+rx,y+ry,rx-4,ry-4,0,0,Math.PI*2);ctx.stroke();}
+            ctx.fillStyle="#f78c6c";
+            if(kind==='key_attr'){
+              ctx.save(); ctx.font="bold 10px monospace"; ctx.textDecoration="underline";
+              ctx.fillText(nd.label,x+rx,y+ry);
+              ctx.beginPath(); const tw=ctx.measureText(nd.label).width;
+              ctx.moveTo(x+rx-tw/2,y+ry+7); ctx.lineTo(x+rx+tw/2,y+ry+7);
+              ctx.strokeStyle="#f78c6c"; ctx.lineWidth=1; ctx.stroke(); ctx.restore();
+            } else { ctx.font="10px monospace"; ctx.fillText(nd.label,x+rx,y+ry); }
+          }
+        });
+
+        resolve(canvas.toDataURL("image/png"));
+      } catch(e){ resolve(null); }
+    });
+  }
+
+  // ── Render Relational Model (Physical ERD) to PNG ─────────────────────────
+  function renderRelationalToPNG(relData, width=700, height=480) {
+    return new Promise(resolve=>{
+      try {
+        const tables = relData?.tables||[];
+        if(!tables.length){ resolve(null); return; }
+        const fkeys = relData?.fkeys||[];
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#0d1117"; ctx.fillRect(0,0,width,height);
+        ctx.fillStyle = "#1e2d3d";
+        for(let x=0;x<width;x+=24) for(let y=0;y<height;y+=24) ctx.fillRect(x,y,1,1);
+
+        const COL_H=20, HDR_H=28, TBL_W=170;
+        const tblH=(t)=>HDR_H+t.cols.length*COL_H;
+
+        // Auto-layout
+        const allZero=tables.every(t=>!t.x&&!t.y);
+        const cols=Math.ceil(Math.sqrt(tables.length));
+        const laid=tables.map((t,i)=>{
+          if(allZero){const col=i%cols,row=Math.floor(i/cols);return{...t,x:20+col*210,y:20+row*160};}
+          return t;
+        });
+
+        const cx=(t)=>t.x+TBL_W/2;
+        const colCy=(t,ci)=>t.y+HDR_H+ci*COL_H+COL_H/2;
+
+        // FK arrows
+        fkeys.forEach(fk=>{
+          const ft=laid.find(t=>t.id===fk.fromTable),tt=laid.find(t=>t.id===fk.toTable);
+          if(!ft||!tt) return;
+          const fci=ft.cols.findIndex(c=>c.id===fk.fromCol);
+          const tci=tt.cols.findIndex(c=>c.id===fk.toCol);
+          const x1=cx(ft),y1=fci>=0?colCy(ft,fci):ft.y+tblH(ft)/2;
+          const x2=cx(tt),y2=tci>=0?colCy(tt,tci):tt.y+tblH(tt)/2;
+          ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+          ctx.strokeStyle="#5a7a94"; ctx.lineWidth=1.5; ctx.setLineDash([4,3]); ctx.stroke();
+          ctx.setLineDash([]);
+          // Arrow
+          const ang=Math.atan2(y2-y1,x2-x1);
+          ctx.fillStyle="#5a7a94";
+          ctx.beginPath(); ctx.moveTo(x2,y2);
+          ctx.lineTo(x2-10*Math.cos(ang-0.4),y2-10*Math.sin(ang-0.4));
+          ctx.lineTo(x2-10*Math.cos(ang+0.4),y2-10*Math.sin(ang+0.4));
+          ctx.closePath(); ctx.fill();
+          // Card label
+          const mx=(x1+x2)/2,my=(y1+y2)/2;
+          ctx.fillStyle="#111720"; ctx.fillRect(mx-16,my-8,32,16);
+          ctx.strokeStyle="#5a7a94"; ctx.lineWidth=1; ctx.strokeRect(mx-16,my-8,32,16);
+          ctx.fillStyle="#5a7a94"; ctx.font="bold 8px monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
+          ctx.fillText(fk.card||"N:1",mx,my);
+        });
+
+        // Tables
+        laid.forEach(tbl=>{
+          const h=tblH(tbl);
+          // Shadow
+          ctx.fillStyle="rgba(0,0,0,.4)"; ctx.fillRect(tbl.x+3,tbl.y+3,TBL_W,h);
+          // Body
           ctx.fillStyle="#181f2a"; ctx.strokeStyle="#2d4a66"; ctx.lineWidth=1.5;
-          if(ctx.roundRect){ctx.beginPath();ctx.roundRect(ent.x,ent.y,ENT_W,h,7);ctx.fill();ctx.stroke();}
-          else{ctx.fillRect(ent.x,ent.y,ENT_W,h);ctx.strokeRect(ent.x,ent.y,ENT_W,h);}
-          ctx.fillStyle="#2d4a66";
-          if(ctx.roundRect){ctx.beginPath();ctx.roundRect(ent.x,ent.y,ENT_W,ENT_HDR,[7,7,0,0]);ctx.fill();}
-          else ctx.fillRect(ent.x,ent.y,ENT_W,ENT_HDR);
-          ctx.fillStyle="#d6e4f0"; ctx.font="bold 12px Arial,sans-serif";
-          ctx.textAlign="center"; ctx.textBaseline="middle";
-          ctx.fillText(ent.name,ent.x+ENT_W/2,ent.y+ENT_HDR/2);
-          ent.attributes.forEach((attr,ai)=>{
-            const ay=ent.y+ENT_HDR+ai*ROW_H;
+          ctx.fillRect(tbl.x,tbl.y,TBL_W,h); ctx.strokeRect(tbl.x,tbl.y,TBL_W,h);
+          // Header
+          ctx.fillStyle="#2d4a66"; ctx.fillRect(tbl.x,tbl.y,TBL_W,HDR_H);
+          ctx.fillStyle="#d6e4f0"; ctx.font="bold 12px Arial,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+          ctx.fillText(tbl.name,tbl.x+TBL_W/2,tbl.y+HDR_H/2);
+          // Columns
+          tbl.cols.forEach((col,ci)=>{
+            const cy2=tbl.y+HDR_H+ci*COL_H;
             ctx.strokeStyle="#1e2d3d"; ctx.lineWidth=0.5;
-            ctx.beginPath(); ctx.moveTo(ent.x,ay); ctx.lineTo(ent.x+ENT_W,ay); ctx.stroke();
-            const icon=attr.isPK?"PK":attr.isFK?"FK":"";
-            if(icon){
-              ctx.fillStyle=attr.isPK?"#ffe082":"#ffb347";
-              ctx.font="bold 8px monospace"; ctx.textAlign="left"; ctx.textBaseline="middle";
-              ctx.fillText(icon,ent.x+5,ay+ROW_H/2);
-            }
-            ctx.fillStyle=attr.isPK?"#ffe082":"#d6e4f0";
-            ctx.font=attr.isPK?"bold 10px monospace":"10px monospace";
-            ctx.textAlign="left"; ctx.textBaseline="middle";
-            ctx.fillText(attr.name,ent.x+(icon?22:8),ay+ROW_H/2);
+            ctx.beginPath(); ctx.moveTo(tbl.x,cy2); ctx.lineTo(tbl.x+TBL_W,cy2); ctx.stroke();
+            if(col.pk){ctx.fillStyle="#ffe082";ctx.font="bold 8px monospace";ctx.textAlign="left";ctx.textBaseline="middle";ctx.fillText("PK",tbl.x+5,cy2+COL_H/2);}
+            else if(col.fk){ctx.fillStyle="#ffb347";ctx.font="bold 8px monospace";ctx.textAlign="left";ctx.textBaseline="middle";ctx.fillText("FK",tbl.x+5,cy2+COL_H/2);}
+            ctx.fillStyle=col.pk?"#ffe082":"#d6e4f0";
+            ctx.font=col.pk?"bold 10px monospace":"10px monospace"; ctx.textAlign="left"; ctx.textBaseline="middle";
+            ctx.fillText(col.name+(col.nn&&!col.pk?"*":""),tbl.x+(col.pk||col.fk?22:8),cy2+COL_H/2);
             ctx.fillStyle="#5a7a94"; ctx.font="9px monospace"; ctx.textAlign="right";
-            ctx.fillText((attr.type||"").split("(")[0],ent.x+ENT_W-5,ay+ROW_H/2);
+            ctx.fillText((col.type||"").split("(")[0],tbl.x+TBL_W-5,cy2+COL_H/2);
           });
         });
-
         resolve(canvas.toDataURL("image/png"));
       } catch(e){ resolve(null); }
     });
@@ -3148,7 +3823,7 @@ function App() {
     if(!quiz){notify("Quiz not found");return;}
     const allStudents = await store.get(QSTUDENTS_KEY, true) || [];
     const qs = quiz.classId ? allStudents.filter(s=>s.classId===quiz.classId) : allStudents;
-    const totalPts = quiz.questions.reduce((s,q)=>s+(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):q.points),0);
+    const totalPts = quiz.questions.reduce((s,q)=>s+((q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.type==="er_logical"||q.type==="er_physical")?(q.points||10):q.points)),0);
     const cls = classes.find(c=>c.id===quiz.classId);
 
     // ── Read all submissions correctly (shared prefix) ────────────────────
@@ -3159,17 +3834,28 @@ function App() {
     }
 
     // ── Pre-render all images ─────────────────────────────────────────────
-    const erPngs  = {}; // `${stId}_${qIdx}` → dataURL
+    const erPngs  = {}; // `${stId}_${qIdx}` → dataURL (logical ERD / scenario ER)
+    const relPngs = {}; // `${stId}_${qIdx}` → dataURL (relational model)
     const sqlPngs = {}; // `${stId}_${qIdx}` → dataURL
     for(const st of qs){
       const sub=subMap[st.id]; if(!sub) continue;
       for(let i=0;i<quiz.questions.length;i++){
         const q=quiz.questions[i];
         if(q.type==="scenario"){
-          if(sub.answers[i]?.er?.entities?.length>0)
+          if(sub.answers[i]?.er?.entities?.length>0||sub.answers[i]?.er?.nodes?.length>0)
             erPngs[`${st.id}_${i}`]=await renderERtoPNG(sub.answers[i].er);
           if(sub.answers[i]?.sql?.trim())
             sqlPngs[`${st.id}_${i}`]=await renderSQLtoPNG(sub.answers[i].sql);
+        }
+        if(q.type==="er_logical"){
+          const ans=sub.answers[i];
+          if(ans?.nodes?.length>0||ans?.entities?.length>0)
+            erPngs[`${st.id}_${i}`]=await renderERtoPNG(ans);
+        }
+        if(q.type==="er_physical"){
+          const ans=sub.answers[i];
+          if(ans?.tables?.length>0)
+            relPngs[`${st.id}_${i}`]=await renderRelationalToPNG(ans);
         }
         if(q.type==="sql"&&sub.answers[i]?.trim())
           sqlPngs[`${st.id}_${i}`]=await renderSQLtoPNG(sub.answers[i]);
@@ -3205,7 +3891,7 @@ function App() {
         if(q.type==="scenario") s=(Number(sub.feedback&&sub.feedback[i+"_er"]||0)+Number(sub.feedback&&sub.feedback[i+"_sql"]||0));
         else if(q.type==="sql") s=Number(sub.feedback&&sub.feedback[i+"_sql"]||0);
         else s=sub.answers[i]===q.correct?q.points:0;
-        var mx=q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):q.points;
+        var mx=(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.type==="er_logical"||q.type==="er_physical")?(q.points||10):q.points);
         var ok=s>=mx;
         return "<td style='text-align:center'><b style='color:"+(ok?"#059669":"#dc2626")+"'>"+s+"</b><span style='color:#94a3b8'>/"+mx+"</span></td>";
       }).join("");
@@ -3244,7 +3930,12 @@ function App() {
         // Score html
         var scoreHtml = "";
         if(sub.marked){
-          if(q.type==="scenario"){
+          if(q.type==="er_logical"||q.type==="er_physical"){
+            var erSc4 = Number(sub.feedback&&sub.feedback[idx+"_er"]||0);
+            var erFb4 = (sub.feedback&&sub.feedback[idx+"_er"])||"";
+            scoreHtml = "<div class='score-row'><span>Score: <b>"+erSc4+"/"+(q.points||10)+"</b></span></div>";
+            if(erFb4) scoreHtml += "<div class='feedback-box'>&#128172; "+erFb4+"</div>";
+          } else if(q.type==="scenario"){
             var erSc  = Number(sub.feedback&&sub.feedback[idx+"_er"]  ||0);
             var sqlSc = Number(sub.feedback&&sub.feedback[idx+"_sql"] ||0);
             var erFb  = (sub.feedback&&sub.feedback[idx+"_er"])  ||"";
@@ -3306,8 +3997,37 @@ function App() {
             ? "<img class='diagram' src='"+sqlPng2+"' alt='SQL Answer'/>"
             : "<div class='answer-box'>"+(scenSQL||"No SQL submitted")+"</div>";
         }
+        if(q.type==="er_logical"){
+          var erPng3 = erPngs[st.id+"_"+idx];
+          var erAns  = sub.answers[idx];
+          answerHtml = "<div class='label'>Scenario</div><div class='answer-box'>"+(q.scenario||q.prompt||"")+"</div>";
+          if(q.requirements&&q.requirements.length){
+            answerHtml += "<div class='label'>Requirements</div><ol style='padding-left:18px;font-size:12px;line-height:1.8'>"
+              +q.requirements.map(function(r){return "<li>"+r+"</li>";}).join("")+"</ol>";
+          }
+          answerHtml += "<div class='label'>Student's Logical ERD</div>";
+          if(erPng3) answerHtml += "<img class='diagram' src='"+erPng3+"' alt='ER Diagram' style='max-width:100%;border-radius:8px;border:1px solid #e2e8f0;display:block;margin:8px 0'/>";
+          else if(erAns&&(erAns.nodes||erAns.entities)){
+            var nodeList=(erAns.nodes||erAns.entities||[]);
+            answerHtml += "<div class='answer-box'>"+(nodeList.length>0?nodeList.map(function(n){return "["+(n.label||n.name)+"]";}).join(" "):"No diagram submitted")+"</div>";
+          } else answerHtml += "<div class='answer-box wrong'>No diagram submitted</div>";
+        }
+        if(q.type==="er_physical"){
+          var relPng3 = relPngs[st.id+"_"+idx];
+          var relAns  = sub.answers[idx];
+          answerHtml = "<div class='label'>Scenario</div><div class='answer-box'>"+(q.scenario||q.prompt||"")+"</div>";
+          if(q.requirements&&q.requirements.length){
+            answerHtml += "<div class='label'>Requirements</div><ol style='padding-left:18px;font-size:12px;line-height:1.8'>"
+              +q.requirements.map(function(r){return "<li>"+r+"</li>";}).join("")+"</ol>";
+          }
+          answerHtml += "<div class='label'>Student's Relational Model</div>";
+          if(relPng3) answerHtml += "<img class='diagram' src='"+relPng3+"' alt='Relational Model' style='max-width:100%;border-radius:8px;border:1px solid #e2e8f0;display:block;margin:8px 0'/>";
+          else if(relAns&&relAns.tables&&relAns.tables.length){
+            answerHtml += "<div class='answer-box'>"+relAns.tables.map(function(t){return t.name+"("+t.cols.map(function(c){return (c.pk?"<u>":"")+c.name+(c.pk?"</u>":"")+(c.fk?"*":"");}).join(", ")+")";}).join("<br/>")+"</div>";
+          } else answerHtml += "<div class='answer-box wrong'>No relational model submitted</div>";
+        }
 
-        var typeLabel = q.type==="mcq"?"MCQ":q.type==="sql"?"SQL":"Scenario";
+        var typeLabel = q.type==="mcq"?"MCQ":q.type==="sql"?"SQL":q.type==="er_logical"?"ER Diagram":q.type==="er_physical"?"Relational Model":"Scenario";
         qBlocks.push(
           "<div class='q-block'>"
           +"<div class='q-hdr'>"
@@ -3370,7 +4090,7 @@ function App() {
       +".q-num{background:#1a2332;color:#fff;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0}"
       +".q-body{padding:14px}"
       +".q-type{font-size:10px;padding:2px 7px;border-radius:10px;font-weight:700;text-transform:uppercase}"
-      +".qt-mcq{background:#dbeafe;color:#1e40af}.qt-sql{background:#d1fae5;color:#065f46}.qt-scenario{background:#f3e8ff;color:#6b21a8}"
+      +".qt-mcq{background:#dbeafe;color:#1e40af}.qt-sql{background:#d1fae5;color:#065f46}.qt-scenario{background:#f3e8ff;color:#6b21a8}.qt-er_logical{background:#fef3c7;color:#92400e}.qt-er_physical{background:#e0f2fe;color:#0369a1}"
       +".answer-box{background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 14px;margin:8px 0;font-family:monospace;font-size:12px;white-space:pre-wrap;line-height:1.6}"
       +".wrong{color:#dc2626;font-weight:700}"
       +".label{font-size:11px;color:#64748b;font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;margin-top:10px}"
@@ -3468,7 +4188,7 @@ function App() {
             score=sub.answers[i]===q.correct?q.points+"/"+q.points+" V":"0/"+q.points+" X"; fb=f[fbKey_mcq]||"";
           }
         }
-        const qMax=q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):q.points;
+        const qMax=(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.type==="er_logical"||q.type==="er_physical")?(q.points||10):q.points);
         ansRows.push([st.name,i+1,q.type,q.prompt||q.scenario||"",ans,score,qMax,fb,sub.submittedAt?new Date(sub.submittedAt).toLocaleString():"",sub.markedAt?new Date(sub.markedAt).toLocaleString():"Not marked"]);
       });
     }
@@ -3514,6 +4234,7 @@ function App() {
       if(q.type==="mcq"){const auto=sub.answers[i]===q.correct?q.points:0;return s+(markScores[`${i}_mcq`]!==undefined?Number(markScores[`${i}_mcq`]):auto);}
       if(q.type==="sql") return s+(markScores[`${i}_sql`]!==undefined?Number(markScores[`${i}_sql`]):0);
       if(q.type==="scenario") return s+(markScores[`${i}_er`]!==undefined?Number(markScores[`${i}_er`]):0)+(markScores[`${i}_sql`]!==undefined?Number(markScores[`${i}_sql`]):0);
+      if(q.type==="er_logical"||q.type==="er_physical") return s+(markScores[`${i}_er`]!==undefined?Number(markScores[`${i}_er`]):0);
       return s;
     },0);
     sub.totalScore=total; sub.feedback=markFeedback; sub.marked=true; sub.markedAt=new Date().toISOString();
@@ -3533,6 +4254,7 @@ function App() {
       if(q.type==="mcq") gotIt = (sub.answers[i]===q.correct);
       else if(q.type==="sql") gotIt = (Number(markScores[i+"_sql"]||0)>0);
       else if(q.type==="scenario") gotIt = ((Number(markScores[i+"_er"]||0)+Number(markScores[i+"_sql"]||0))>0);
+      else if(q.type==="er_logical"||q.type==="er_physical") gotIt = (Number(markScores[i+"_er"]||0)>0);
       if(gotIt){ totalReward+=rewardPts; rewardLines.push("Q"+(i+1)+": +"+rewardPts+"pts"); }
     });
     if(totalReward>0){
@@ -3548,16 +4270,22 @@ function App() {
     const quiz={id:newQuiz.id||uid(),title:newQuiz.title.trim(),description:newQuiz.description||"",questions:qs,classId:newQuiz.classId||curClassId||null,created:newQuiz.created||new Date().toISOString()};
     await store.set(QUIZ_PFX+quiz.id,quiz,true);
     const list=await store.get(QUIZZES_KEY,true)||[];
-    const meta={id:quiz.id,title:quiz.title,qCount:qs.length,totalPts:qs.reduce((s,q)=>s+(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.points||1)),0),created:quiz.created,classId:quiz.classId,timer:(list.find(x=>x.id===quiz.id)?.timer||null)};
+    const meta={id:quiz.id,title:quiz.title,qCount:qs.length,totalPts:qs.reduce((s,q)=>s+(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.type==="er_logical"||q.type==="er_physical")?(q.points||10):(q.points||1)),0),created:quiz.created,classId:quiz.classId,timer:(list.find(x=>x.id===quiz.id)?.timer||null)};
     await store.set(QUIZZES_KEY,[...list.filter(x=>x.id!==quiz.id),meta],true);
     setQuizList(l=>[...l.filter(x=>x.id!==quiz.id),meta]); setModal(null); setNewQuiz(null); notify("Quiz saved! 📝");
   }
-  async function deleteQuiz(id,e){
-    e.stopPropagation();
-    if(!confirm("Delete this quiz?")) return;
-    await store.del(QUIZ_PFX+id,true);
-    const upd=(await store.get(QUIZZES_KEY,true)||[]).filter(q=>q.id!==id);
-    await store.set(QUIZZES_KEY,upd,true); setQuizList(upd); if(curQuiz?.id===id) setCurQuiz(null); notify("Quiz deleted");
+  function deleteQuiz(id, e){
+    if(e) { e.stopPropagation(); e.preventDefault(); }
+    setConfirmDeleteQuizId(id);
+  }
+  function doDeleteQuiz(id){
+    LS.del("__shared__" + QUIZ_PFX + id);
+    const updList = quizList.filter(q=>q.id!==id);
+    LS.set("__shared__" + QUIZZES_KEY, updList);
+    setQuizList(updList);
+    if(curQuiz && curQuiz.id===id) setCurQuiz(null);
+    setConfirmDeleteQuizId(null);
+    notify("Quiz deleted 🗑");
   }
   async function toggleQuizLock(id,e){
     e.stopPropagation();
@@ -3967,6 +4695,7 @@ function App() {
                     <button className="btn btn-ghost btn-sm" onClick={refreshQuizData}>↻</button>
                     {curQuiz&&<button className="btn btn-sm export-btn" onClick={()=>exportQuizExcel(curQuiz.id)}>📊 Export</button>}
                     {curQuiz&&<TimerControls quizId={curQuiz.id} ti={timerInfo(curQuiz.id)} onStart={startQuizTimer} onStop={stopQuizTimer}/>}
+                    {curQuiz&&<button className="btn btn-sm" style={{background:"#ff537022",color:"#ff5370",border:"1px solid #ff537044"}} onClick={()=>deleteQuiz(curQuiz.id)}>🗑 Delete</button>}
                     <button className="btn btn-purple btn-sm" onClick={()=>{setNewQuiz({title:"",description:"",classId:curClassId,questions:[{type:"mcq",prompt:"",options:["","","",""],correct:0,points:1}]});setModal("create-quiz");}}>+ New Quiz</button>
                   </div>
                 </div>
@@ -4041,7 +4770,7 @@ function App() {
                                   {["Student","Submitted","Score","Grade","Action"].map(h=><div key={h} style={{padding:"8px 12px",fontSize:9,fontWeight:700,textTransform:"uppercase",letterSpacing:1,color:T.muted,borderBottom:`1px solid ${T.border}`,background:T.bg}}>{h}</div>)}
                                   {filteredStudents.map(st=>{
                                     const sub=quizSubs[st.id]?.[curQuiz.id];
-                                    const totalPts=curQuiz.questions.reduce((s,q)=>s+(q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):q.points),0);
+                                    const totalPts=curQuiz.questions.reduce((s,q)=>s+((q.type==="scenario"?(q.erPoints||5)+(q.sqlPoints||5):(q.type==="er_logical"||q.type==="er_physical")?(q.points||10):q.points)),0);
                                     return [
                                       <div key={st.id+"n"} style={{padding:"9px 12px",fontSize:12,fontWeight:600,borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center"}}>{st.name}</div>,
                                       <div key={st.id+"d"} style={{padding:"9px 12px",fontSize:10,color:T.muted,borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center"}}>{sub?new Date(sub.submittedAt).toLocaleString():"—"}</div>,
@@ -4160,151 +4889,17 @@ function App() {
         );
       })()}
 
-      {modal==="students"&&(()=>{
-        const studs=students;
-        const SCOLS=["#4fc3f7","#43d98c","#c792ea","#ffb347","#ff5370","#80cbc4"];
-        const [resetTarget,setResetTarget]=useState(null);
-        const [newPass,setNewPass]=useState("");
-        const [showAdd,setShowAdd]=useState(false);
-        const [addName,setAddName]=useState("");
-        const [addPass,setAddPass]=useState("");
-        const [addClassId,setAddClassId]=useState(classes[0]?.id||"");
-        const [addColor,setAddColor]=useState("#4fc3f7");
-        const [addErr,setAddErr]=useState("");
-        const [filterClass,setFilterClass]=useState("all");
-
-        function exportStudentsExcel(){
-          try {
-            const rows=[["Name","Class","Joined","Colour"]];
-            studs.forEach(s=>{
-              const cls=classes.find(c=>c.id===s.classId);
-              rows.push([s.name,cls?cls.name:"—",new Date(s.created).toLocaleDateString(),s.color]);
-            });
-            const ws=XLSX.utils.aoa_to_sheet(rows);
-            ws["!cols"]=[{wch:24},{wch:18},{wch:14},{wch:10}];
-            const wb=XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(wb,"Students",ws);
-            const b64=XLSX.write(wb,{bookType:"xlsx",type:"base64"});
-            const a=document.createElement("a");
-            a.href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"+b64;
-            a.download="students.xlsx"; a.click();
-          } catch(e){ alert("Export failed: "+e.message); }
-        }
-
-        function handleAddStudent(){
-          setAddErr("");
-          if(!addName.trim()||!addPass.trim()||!addClassId){setAddErr("Fill in all fields");return;}
-          if(addPass.length<3){setAddErr("Password must be at least 3 characters");return;}
-          const res=createStudentAccount(addName.trim(),addPass,addClassId,addColor);
-          if(res==="exists"){setAddErr("A student with that name already exists");return;}
-          setAddName(""); setAddPass(""); setAddErr(""); setShowAdd(false);
-          setStudents(LS.get("__shared__"+STUDENTS_KEY)||[]);
-        }
-
-        const visibleStuds=filterClass==="all"?studs:studs.filter(s=>s.classId===filterClass);
-
-        return (
-          <div className="overlay" onClick={()=>setModal(null)}>
-            <div className="modal modal-lg" onClick={e=>e.stopPropagation()} style={{maxWidth:600,display:"flex",flexDirection:"column",maxHeight:"88vh"}}>
-              <div className="mhdr">
-                <span>👥 Student Accounts</span>
-                <div style={{display:"flex",gap:6,marginLeft:"auto",marginRight:8}}>
-                  <button className="btn btn-green btn-sm" onClick={exportStudentsExcel}>📥 Export Excel</button>
-                  <button className="btn btn-run btn-sm" onClick={()=>{setShowAdd(!showAdd);setAddErr("");}}>
-                    {showAdd?"✕ Cancel":"+ Add Student"}
-                  </button>
-                </div>
-                <button className="xbtn" onClick={()=>setModal(null)}>✕</button>
-              </div>
-
-              {/* Add student form */}
-              {showAdd&&(
-                <div style={{padding:"16px 20px",borderBottom:"1px solid #1e2d3d",background:"#0a1628"}}>
-                  <div style={{fontSize:10,fontWeight:700,color:"#4fc3f7",textTransform:"uppercase",letterSpacing:1,marginBottom:12}}>New Student</div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
-                    <div>
-                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Full Name</label>
-                      <input value={addName} onChange={e=>setAddName(e.target.value)} placeholder="e.g. Alice Johnson"
-                        style={{width:"100%",padding:"8px 10px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:6,color:"#d6e4f0",fontSize:12,boxSizing:"border-box"}} autoFocus/>
-                    </div>
-                    <div>
-                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Password</label>
-                      <input type="password" value={addPass} onChange={e=>setAddPass(e.target.value)} placeholder="••••••"
-                        style={{width:"100%",padding:"8px 10px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:6,color:"#d6e4f0",fontSize:12,boxSizing:"border-box"}}/>
-                    </div>
-                  </div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:10,alignItems:"end"}}>
-                    <div>
-                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Class</label>
-                      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                        {classes.map(c=>(
-                          <div key={c.id} onClick={()=>setAddClassId(c.id)} style={{padding:"5px 12px",borderRadius:99,border:`2px solid ${addClassId===c.id?c.color:"#1e2d3d"}`,background:addClassId===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:11,fontWeight:700,color:addClassId===c.id?c.color:"#3d5a73",transition:"all .15s"}}>
-                            {c.name}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                    <div>
-                      <label style={{display:"block",fontSize:9,color:"#3d5a73",fontWeight:700,textTransform:"uppercase",letterSpacing:.8,marginBottom:4}}>Colour</label>
-                      <div style={{display:"flex",gap:5}}>
-                        {SCOLS.map(c=><div key={c} onClick={()=>setAddColor(c)} style={{width:18,height:18,borderRadius:"50%",background:c,cursor:"pointer",border:addColor===c?"2px solid white":"2px solid transparent",boxShadow:addColor===c?`0 0 0 1px ${c}`:"none"}}/>)}
-                      </div>
-                    </div>
-                  </div>
-                  {addErr&&<div style={{marginTop:8,fontSize:11,color:"#ff5370"}}>{addErr}</div>}
-                  <button className="btn btn-run btn-sm" style={{marginTop:12}} onClick={handleAddStudent}>Create Account</button>
-                </div>
-              )}
-
-              {/* Class filter bar */}
-              {classes.length>1&&(
-                <div style={{display:"flex",gap:6,padding:"10px 20px 0",flexWrap:"wrap"}}>
-                  <div onClick={()=>setFilterClass("all")} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass==="all"?"#4fc3f7":"#1e2d3d"}`,background:filterClass==="all"?"#4fc3f722":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass==="all"?"#4fc3f7":"#3d5a73"}}>All</div>
-                  {classes.map(c=><div key={c.id} onClick={()=>setFilterClass(c.id)} style={{padding:"3px 10px",borderRadius:99,border:`1px solid ${filterClass===c.id?c.color:"#1e2d3d"}`,background:filterClass===c.id?c.color+"22":"transparent",cursor:"pointer",fontSize:10,fontWeight:700,color:filterClass===c.id?c.color:"#3d5a73"}}>{c.name}</div>)}
-                </div>
-              )}
-
-              <div className="mbody" style={{flex:1,overflowY:"auto"}}>
-                {visibleStuds.length===0
-                  ?<div className="empty"><div className="empty-ico">👥</div><div>{studs.length===0?"No students yet — add one above or have them register":"No students in this class"}</div></div>
-                  :visibleStuds.map(stu=>{
-                    const cls=classes.find(c=>c.id===stu.classId);
-                    return (
-                      <div key={stu.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 12px",borderRadius:8,background:"#0d1b2a",border:"1px solid #1e2d3d",marginBottom:8}}>
-                        <div style={{width:34,height:34,borderRadius:"50%",background:stu.color+"33",border:`2px solid ${stu.color}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>👨‍💻</div>
-                        <div style={{flex:1,minWidth:0}}>
-                          <div style={{fontSize:13,fontWeight:700,color:"#d6e4f0"}}>{stu.name}</div>
-                          <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}>
-                            {cls&&<span style={{fontSize:9,padding:"1px 6px",borderRadius:99,background:cls.color+"22",color:cls.color,fontWeight:700,border:`1px solid ${cls.color}44`}}>{cls.name}</span>}
-                            <span style={{fontSize:9,color:"#3d5a73"}}>{new Date(stu.created).toLocaleDateString()}</span>
-                          </div>
-                        </div>
-                        {resetTarget===stu.id?(
-                          <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                            <input placeholder="New password" value={newPass} onChange={e=>setNewPass(e.target.value)}
-                              style={{padding:"5px 8px",background:"#0a1628",border:"1px solid #1e2d3d",borderRadius:5,color:"#d6e4f0",fontSize:11,width:120}}/>
-                            <button className="btn btn-green btn-sm" onClick={()=>{if(newPass.length>=3){resetStudentPassword(stu.id,newPass);setResetTarget(null);setNewPass("");}}} style={{padding:"5px 10px"}}>Save</button>
-                            <button className="btn btn-ghost btn-sm" onClick={()=>{setResetTarget(null);setNewPass("");}} style={{padding:"5px 10px"}}>✕</button>
-                          </div>
-                        ):(
-                          <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                            {(()=>{const pts=(LS.get("__shared__"+POINTS_KEY)||{})[stu.sessionId];return pts?<span style={{fontSize:9,color:"#ffd700",background:"#ffd70015",padding:"2px 7px",borderRadius:99,fontWeight:700,border:"1px solid #ffd70030"}}>{pts.total||0} pts</span>:null;})()}
-                            <button className="btn btn-ghost btn-sm" style={{fontSize:10}} onClick={()=>setResetTarget(stu.id)}>🔑 Reset pw</button>
-                            <button className="btn btn-ghost btn-sm" style={{fontSize:10,color:"#ff5370",borderColor:"#ff537044"}} onClick={e=>{e.stopPropagation();deleteStudent(stu.id,null);}}>🗑 Delete</button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })
-                }
-              </div>
-              <div className="mftr" style={{fontSize:10,color:"#3d5a73"}}>
-                {visibleStuds.length} of {studs.length} student{studs.length!==1?"s":""}
-              </div>
-            </div>
-          </div>
-        );
-      })()}
+      {modal==="students"&&(
+        <StudentsModal
+          students={students}
+          classes={classes}
+          onClose={()=>setModal(null)}
+          resetStudentPassword={resetStudentPassword}
+          deleteStudent={deleteStudent}
+          createStudentAccount={createStudentAccount}
+          setStudents={setStudents}
+        />
+      )}
 
       {modal==="new-session"&&(
         <div className="overlay" onClick={()=>setModal("sessions")}>
@@ -4393,6 +4988,28 @@ function App() {
       {notif&&<div className="notif"><span style={{fontSize:14}}>{notif.icon}</span>{notif.msg}</div>}
 
       {/* Loading screen */}
+      {confirmDeleteQuizId&&(()=>{
+        const q = quizList.find(x=>x.id===confirmDeleteQuizId);
+        return (
+          <div className="overlay" style={{zIndex:500}} onClick={()=>setConfirmDeleteQuizId(null)}>
+            <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:380}}>
+              <div className="mhdr"><span>🗑 Delete Quiz</span></div>
+              <div className="mbody" style={{textAlign:"center",padding:"24px 20px"}}>
+                <div style={{fontSize:32,marginBottom:12}}>⚠️</div>
+                <div style={{fontSize:14,fontWeight:700,color:"#d6e4f0",marginBottom:8}}>
+                  Delete {q ? '"'+q.title+'"' : "this quiz"}?
+                </div>
+                <div style={{fontSize:12,color:"#5a7a94"}}>This cannot be undone. All submissions will be lost.</div>
+              </div>
+              <div className="mftr" style={{gap:10}}>
+                <button className="btn btn-ghost" onClick={()=>setConfirmDeleteQuizId(null)}>Cancel</button>
+                <button className="btn" style={{background:"#ff5370",color:"#fff"}} onClick={()=>doDeleteQuiz(confirmDeleteQuizId)}>Delete Quiz</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {loginScreen&&(
         <LoginScreen
           classes={classes}
