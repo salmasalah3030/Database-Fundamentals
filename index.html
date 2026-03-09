@@ -253,9 +253,15 @@ const SHARED_SUBSCRIBE_KEYS = [
   "mysqlide:classes","mysqlide:students","mysqlide:teacher",
   "mysqlide:quizzes","mysqlide:qstudents","mysqlide:points","mysqlide:qrpts",
   "mysqlide:marathon","mysqlide:mstudents","mysqlide:shared-db",
+  // Whiteboard keys for both class groups (a and b are the permanent group IDs)
+  "mysqlide:wb:a","mysqlide:wb:b",
+  "mysqlide:wbn:a","mysqlide:wbn:b",
+  "mysqlide:wb:shared","mysqlide:wbn:shared",
+  // Quiz submissions by student (dynamic — subscribed when student logs in)
 ];
-function subscribeSharedKeys() {
-  SHARED_SUBSCRIBE_KEYS.forEach(k => {
+function subscribeSharedKeys(extraKeys=[]) {
+  const keys = [...SHARED_SUBSCRIBE_KEYS, ...extraKeys];
+  keys.forEach(k => {
     fbSubscribe(k, val => {
       if (val !== null && val !== undefined) _origLSset("__cache__"+k, val);
     });
@@ -1227,6 +1233,85 @@ table.rtbl tr:last-child td{border-bottom:none}
 table.rtbl tr:hover td{background:rgba(79,195,247,.04)}
 .status-bar{padding:3px 12px;background:${T.surface};border-top:1px solid ${T.border};font-size:9px;color:${T.muted};display:flex;gap:12px;align-items:center;flex-shrink:0}
 .s-ok{color:${T.green}}.s-err{color:${T.red}}
+
+/* ── Mobile bottom nav ─────────────────────────────────────────────────── */
+.mobile-nav {
+  display: none;
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: 56px;
+  background: #111720;
+  border-top: 1px solid #1e2d3d;
+  z-index: 90;
+  flex-direction: row;
+}
+
+/* ── Mobile responsive ─────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  /* Show bottom nav, hide desktop tabs */
+  .mobile-nav { display: flex !important; }
+  #desktop-tabs { display: none !important; }
+
+  /* App grid: header + content + bottom nav */
+  .app { grid-template-rows: 48px 1fr; padding-bottom: 56px; box-sizing: border-box; }
+
+  /* Header — compact */
+  .hdr { padding: 0 10px; gap: 5px; }
+  .hdr-sep { min-width: 4px; }
+  .tag { display: none; }
+  .logo-sub { display: none !important; }
+
+  /* IDE: single column */
+  .ide-grid { grid-template-columns: 1fr !important; }
+  .sidebar { display: none; }
+  .rpanel  { display: none; }
+  .results-pane { max-height: 40vh; }
+
+  /* Modals — full screen */
+  .modal, .modal-lg, .modal-xl {
+    width: 100vw !important;
+    max-width: 100vw !important;
+    max-height: calc(100vh - 56px) !important;
+    height: calc(100vh - 56px);
+    border-radius: 0 !important;
+    margin: 0;
+  }
+  .overlay { align-items: flex-start; }
+
+  /* Rewards sidebar stacks on top */
+  .rw-wrap { flex-direction: column; }
+  .rw-sidebar { width: 100% !important; height: auto; max-height: 35vh; border-right: none; border-bottom: 1px solid #1e2d3d; }
+
+  /* Leaderboard */
+  .lb-row { grid-template-columns: 28px 1fr auto; gap: 8px; padding: 9px 12px; }
+  .lb-pts { font-size: 15px; min-width: 40px; }
+
+  /* Badge grid */
+  .badge-grid { grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 10px; }
+
+  /* Give points row */
+  .give-pts-row { grid-template-columns: 1fr 60px auto; gap: 6px; }
+
+  /* Whiteboard — full width stickies */
+  .sticky { min-width: 140px !important; max-width: 88vw !important; }
+
+  /* Quiz cards */
+  .quiz-card { padding: 10px 12px; }
+
+  /* Status bar */
+  .status-bar { gap: 8px; padding: 2px 10px; font-size: 8px; }
+
+  /* Buttons */
+  .btn { font-size: 10px; padding: 5px 9px; }
+  .btn-sm { font-size: 9px; padding: 4px 7px; }
+}
+
+@media (max-width: 480px) {
+  .modal, .modal-lg, .modal-xl { border-radius: 0 !important; }
+  .mbody { padding: 10px 12px; }
+  .mhdr { padding: 10px 12px 8px; font-size: 13px; }
+  .mftr { padding: 8px 12px; flex-wrap: wrap; gap: 6px; }
+}
 .rpanel{background:${T.surface};border-left:1px solid ${T.border};display:flex;flex-direction:column;overflow:hidden}
 .pcontent{flex:1;overflow-y:auto;padding:8px}
 .hist-item{padding:6px 8px;border-radius:4px;cursor:pointer;margin-bottom:3px;transition:background .1s;user-select:none}
@@ -3021,22 +3106,17 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
   const canvasRef = useRef(null);
   const dragRef   = useRef(null);
 
-  // Auto-select class strictly from session classId — never fall back to first class
+  // Everyone shares one board — use "shared" as the board key
   useEffect(()=>{
     if(!curSess) return;
-    if(isTeacher) {
-      if(classes.length>0 && !selClassId) setSelClassId(classes[0].id);
-    } else {
-      // Students: only use classId stored on session. No guessing.
-      setSelClassId(curSess.classId||null);
-    }
-  },[curSess ? curSess.id : null, curSess ? curSess.classId : null, isTeacher]);
+    setSelClassId("shared");
+  },[curSess ? curSess.id : null]);
 
   // Load & poll whiteboard data
   useEffect(()=>{
     if(!selClassId) return;
     loadBoard();
-    pollRef.current = setInterval(loadBoard, 2000);
+    pollRef.current = setInterval(loadBoard, 1500);
     return ()=>{
       clearInterval(pollRef.current);
       // clean up any lingering drag listeners
@@ -3047,20 +3127,20 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
 
   async function loadBoard(){
     if(!selClassId) return;
-    const p = LS.get("__shared__"+WB_PFX+selClassId)   ||"";
-    const n = LS.get("__shared__"+WB_NOTES_PFX+selClassId)||[];
+    const p = (await store.get(WB_PFX+selClassId, true))   ||"";
+    const n = (await store.get(WB_NOTES_PFX+selClassId, true))||[];
     setPrompt(prev=>prev===p?prev:p);
     setNotes(prev=>JSON.stringify(prev)===JSON.stringify(n)?prev:n);
   }
 
   async function savePrompt(text){
-    LS.set("__shared__"+WB_PFX+selClassId, text);
+    await store.set(WB_PFX+selClassId, text, true);
     setPrompt(text);
   }
 
   async function addNote(){
     if(!curSess||!selClassId) return;
-    const existing = LS.get("__shared__"+WB_NOTES_PFX+selClassId)||[];
+    const existing = (await store.get(WB_NOTES_PFX+selClassId,true))||[];
     // spread notes around canvas center
     const angle = Math.random()*Math.PI*2;
     const r = 180 + Math.random()*160;
@@ -3079,35 +3159,35 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
       created: Date.now()
     };
     const upd = [...existing, note];
-    LS.set("__shared__"+WB_NOTES_PFX+selClassId, upd);
+    await store.set(WB_NOTES_PFX+selClassId, upd, true);
     setNotes(upd);
   }
 
   async function updateNote(id, changes){
-    const existing = LS.get("__shared__"+WB_NOTES_PFX+selClassId)||[];
+    const existing = (await store.get(WB_NOTES_PFX+selClassId,true))||[];
     const upd = existing.map(n=>n.id===id?{...n,...changes}:n);
-    LS.set("__shared__"+WB_NOTES_PFX+selClassId, upd);
+    await store.set(WB_NOTES_PFX+selClassId, upd, true);
     setNotes(upd);
   }
 
   async function deleteNote(id){
-    const existing = LS.get("__shared__"+WB_NOTES_PFX+selClassId)||[];
+    const existing = (await store.get(WB_NOTES_PFX+selClassId,true))||[];
     const upd = existing.filter(n=>n.id!==id);
-    LS.set("__shared__"+WB_NOTES_PFX+selClassId, upd);
+    await store.set(WB_NOTES_PFX+selClassId, upd, true);
     setNotes(upd);
   }
 
   async function clearBoard(){
     if(!confirm("Clear all sticky notes on this board?")) return;
-    LS.set("__shared__"+WB_NOTES_PFX+selClassId, []);
-    LS.set("__shared__"+WB_PFX+selClassId, "");
+    await store.set(WB_NOTES_PFX+selClassId, [], true);
+    await store.set(WB_PFX+selClassId, "", true);
     setNotes([]); setPrompt("");
   }
 
   // Place a free-floating sticker on the canvas
   async function addStickerToBoard(emoji){
     if(!curSess||!selClassId) return;
-    const existing = LS.get("__shared__"+WB_NOTES_PFX+selClassId)||[];
+    const existing = (await store.get(WB_NOTES_PFX+selClassId,true))||[];
     const cx = (canvasRef.current?.clientWidth||800)/2;
     const cy = 300 + Math.random()*200;
     const sticker = {
@@ -3122,20 +3202,20 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
       created: Date.now()
     };
     const upd = [...existing, sticker];
-    LS.set("__shared__"+WB_NOTES_PFX+selClassId, upd);
+    await store.set(WB_NOTES_PFX+selClassId, upd, true);
     setNotes(upd);
     setStickerTarget(null);
   }
 
   // Attach a sticker badge to an existing note
   async function addStickerToNote(noteId, emoji){
-    const existing = LS.get("__shared__"+WB_NOTES_PFX+selClassId)||[];
+    const existing = (await store.get(WB_NOTES_PFX+selClassId,true))||[];
     const upd = existing.map(n=>{
       if(n.id!==noteId) return n;
       const stickers = [...(n.stickers||[]), {emoji, by:curSess.name, at:Date.now()}];
       return {...n, stickers};
     });
-    LS.set("__shared__"+WB_NOTES_PFX+selClassId, upd);
+    await store.set(WB_NOTES_PFX+selClassId, upd, true);
     setNotes(upd);
     setStickerTarget(null);
   }
@@ -3267,56 +3347,18 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
     <div className="wb-no-class"><div style={{fontSize:42}}>🪧</div><div style={{fontSize:16,fontWeight:700}}>Open a session to use the Whiteboard</div></div>
   );
 
-  if(classes.length===0) return (
-    <div className="wb-no-class"><div style={{fontSize:42}}>🏫</div><div style={{fontSize:16,fontWeight:700}}>No classes yet</div><div style={{fontSize:13,color:"#5a7a94"}}>A teacher must create a class before the whiteboard is available</div></div>
-  );
 
-  // Student has no class assigned — show a picker before letting them in
-  if(!isTeacher && !selClassId) return (
-    <div className="wb-no-class" style={{gap:20}}>
-      <div style={{fontSize:48}}>🏫</div>
-      <div style={{fontSize:17,fontWeight:800,color:"#d6e4f0"}}>Which class are you in?</div>
-      <div style={{fontSize:12,color:"#5a7a94",marginBottom:4}}>Your session wasn't linked to a class. Pick yours to continue.</div>
-      <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%",maxWidth:320}}>
-        {classes.map(c=>(
-          <div key={c.id} onClick={()=>assignClassToSession(c.id)}
-            style={{padding:"13px 20px",borderRadius:12,border:`2px solid ${c.color}`,background:c.color+"18",cursor:"pointer",display:"flex",alignItems:"center",gap:12,transition:"all .15s"}}
-            onMouseEnter={e=>e.currentTarget.style.background=c.color+"33"}
-            onMouseLeave={e=>e.currentTarget.style.background=c.color+"18"}>
-            <span style={{width:14,height:14,borderRadius:"50%",background:c.color,display:"inline-block",flexShrink:0}}/>
-            <span style={{fontSize:14,fontWeight:700,color:c.color}}>{c.name}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
 
   return (
     <div className="wb-wrap">
       {/* Toolbar */}
       <div className="wb-toolbar">
         <span style={{fontSize:13,fontWeight:800,color:"#d6e4f0",marginRight:4}}>🪧 Whiteboard</span>
-        {isTeacher ? (
-          <div className="wb-class-pick">
-            {classes.map(c=>(
-              <div key={c.id} className="wb-cls-btn"
-                style={{borderColor:c.color,background:selClassId===c.id?c.color+"33":"transparent",color:selClassId===c.id?c.color:"#5a7a94"}}
-                onClick={()=>setSelClassId(c.id)}>
-                <span style={{width:7,height:7,borderRadius:"50%",background:c.color,display:"inline-block",marginRight:5}}/>
-                {c.name}
-              </div>
-            ))}
-          </div>
-        ) : (
-          selClass&&<div style={{display:"flex",alignItems:"center",gap:6,fontSize:12}}>
-            <span style={{width:9,height:9,borderRadius:"50%",background:selClass.color,display:"inline-block"}}/>
-            <span style={{color:selClass.color,fontWeight:700}}>{selClass.name}</span>
-          </div>
-        )}
+        <div style={{fontSize:11,color:"#5a7a94",fontWeight:600}}>shared board</div>
 
         <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
           {/* Live presence avatars */}
-          {selClassId&&authors.length>0&&(
+          {authors.length>0&&(
             <div style={{display:"flex",alignItems:"center",gap:4}}>
               <span className="wb-live-dot"/>
               <span style={{fontSize:10,color:"#43d98c",fontWeight:700,marginRight:4}}>{authors.length} active</span>
@@ -3327,7 +3369,7 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
               ))}
             </div>
           )}
-          {isTeacher&&selClassId&&(
+          {isTeacher&&(
             <>
               <button className="btn btn-ghost btn-sm" onClick={()=>{setEditingPrompt(true);setDraftPrompt(prompt);}}>✏️ {prompt?"Edit":"Set"} Prompt</button>
               <button className="btn btn-teal btn-sm" onClick={()=>setStickerTarget("board")}>🎨 Add Sticker</button>
@@ -3369,14 +3411,8 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
         />
       )}
 
-      {/* No class selected */}
-      {!selClassId&&(
-        <div className="wb-no-class"><div style={{fontSize:38}}>👆</div><div>Select a class above to open its whiteboard</div></div>
-      )}
-
       {/* Canvas */}
-      {selClassId&&(
-        <div className="wb-canvas" ref={canvasRef} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+      <div className="wb-canvas" ref={canvasRef} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
           <div style={{position:"relative",width:canvasW,height:canvasH,minHeight:"100%"}}>
 
             {/* Prompt banner */}
@@ -3463,13 +3499,12 @@ function Whiteboard({curSess, classes, isTeacher, onClassAssigned}) {
             })}
           </div>
         </div>
-      )}
 
       {/* Add note FAB */}
-      {selClassId&&!isTeacher&&(
+      {!isTeacher&&(
         <button className="wb-add-btn" onClick={addNote} title="Add sticky note">+</button>
       )}
-      {selClassId&&isTeacher&&(
+      {isTeacher&&(
         <button className="wb-add-btn" style={{background:"#c792ea"}} onClick={addNote} title="Add teacher note">+</button>
       )}
     </div>
@@ -3514,8 +3549,8 @@ function ConnectScreen({onConnected, onSkip}) {
   }
 
   return(
-    <div style={{position:"fixed",inset:0,background:"#0a1628",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",zIndex:300}}>
-      <div style={{width:"100%",maxWidth:400,padding:"0 24px"}}>
+    <div style={{position:"fixed",inset:0,background:"#0a1628",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",zIndex:300,overflowY:"auto",padding:"12px 0"}}>
+      <div style={{width:"100%",maxWidth:400,padding:"0 20px",boxSizing:"border-box"}}>
         <div style={{textAlign:"center",marginBottom:36}}>
           <div style={{fontSize:52,marginBottom:6}}>⚡</div>
           <div style={{fontSize:26,fontWeight:900,color:"#d6e4f0",letterSpacing:-0.5}}>QueryClass</div>
@@ -3718,13 +3753,13 @@ function LoginScreen({classes: initialClasses, onLoginTeacher, onLoginStudent, o
     } finally { setBusy(false); }
   }
 
-  const inputStyle={width:"100%",padding:"10px 13px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:8,color:"#d6e4f0",fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box",transition:"border .15s"};
+  const inputStyle={width:"100%",padding:"10px 13px",background:"#0d1b2a",border:"1px solid #1e2d3d",borderRadius:8,color:"#d6e4f0",fontSize:16,fontFamily:"inherit",outline:"none",boxSizing:"border-box",transition:"border .15s"};
   const focusInput=e=>{e.target.style.borderColor="#4fc3f7";};
   const blurInput=e=>{e.target.style.borderColor="#1e2d3d";};
 
   return (
-    <div style={{position:"fixed",inset:0,background:"#0a1628",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",zIndex:300}}>
-      <div style={{width:"100%",maxWidth:420,padding:"0 20px"}}>
+    <div style={{position:"fixed",inset:0,background:"#0a1628",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Syne',sans-serif",zIndex:300,overflowY:"auto",padding:"12px 0"}}>
+      <div style={{width:"100%",maxWidth:420,padding:"0 16px",boxSizing:"border-box"}}>
         {/* Logo */}
         <div style={{textAlign:"center",marginBottom:36}}>
           <div style={{fontSize:52,marginBottom:6}}>⚡</div>
@@ -5063,29 +5098,38 @@ function App() {
         <header className="hdr">
           <div className="logo">
             <div className="logo-mark">⚡</div>
-            <div><div>QueryClass</div><div className="logo-sub">SQL Learning Platform</div></div>
+            <div><div>QueryClass</div><div className="logo-sub" style={{display:"none"}} id="logo-sub-desktop">SQL Learning Platform</div></div>
           </div>
-          <div className="hdr-tabs">
+          <div className="hdr-tabs" id="desktop-tabs">
             {[["ide","💻 Editor"],["marathon","🏃 Marathon"],["quiz","📝 Quizzes"],["whiteboard","🪧 Whiteboard"],["rewards","🏆 Rewards"]].map(([v,l])=>(
               <div key={v} className={`hdr-tab ${view===v?"active":""}`} onClick={()=>{setView(v);if(v==="marathon")refreshMarathon();if(v==="quiz")refreshQuizData();}}>
                 {l}
                 {v==="marathon"&&marathon&&<span style={{marginLeft:4,background:T.accentGlow,color:T.accent,borderRadius:3,padding:"0 4px",fontSize:9}}>{marathon.questions.length}Q</span>}
                 {v==="quiz"&&quizList.length>0&&<span style={{marginLeft:4,background:"rgba(199,146,234,.15)",color:T.purple,borderRadius:3,padding:"0 4px",fontSize:9}}>{quizList.length}</span>}
-                {v==="whiteboard"&&classes.length>0&&<span style={{marginLeft:4,background:"rgba(67,217,140,.12)",color:"#43d98c",borderRadius:3,padding:"0 4px",fontSize:9}}>{classes.length}</span>}
                 {v==="rewards"&&<span style={{marginLeft:4,background:"rgba(255,215,0,.12)",color:"#ffd700",borderRadius:3,padding:"0 4px",fontSize:9}}>🏆</span>}
               </div>
             ))}
           </div>
           <div className="hdr-sep"/>
-          {curSess&&<div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+          {curSess&&<div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
             <div className="dot" style={{background:T.green,boxShadow:`0 0 7px ${T.green}`}}/>
-            <div style={{fontSize:11,color:T.text,fontWeight:700}}>{curSess.name}</div>
-            <span className={`tag ${curSess.role==="teacher"?"tag-t":"tag-s"}`}>{curSess.role}</span>
-            {isTeacher&&<button className="btn btn-ghost btn-sm" onClick={()=>{setStudents(LS.get("__shared__"+STUDENTS_KEY)||[]);setModal("students");}}>👥 Students</button>}
-            {isTeacher&&<button className="btn btn-ghost btn-sm" onClick={()=>setModal("firebase-setup")} style={{borderColor:fbConnected?"#43d98c44":"#ffb34744",color:fbConnected?"#43d98c":"#ffb347"}}>{fbConnected?"🔥 "+fbRoomCode:"🔥 Connect"}</button>}
-            <button className="btn btn-ghost btn-sm" onClick={logout} style={{color:"#ff5370",borderColor:"#ff537044"}}>Sign Out</button>
+            <div style={{fontSize:11,color:T.text,fontWeight:700,maxWidth:"80px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{curSess.name}</div>
+            {isTeacher&&<button className="btn btn-ghost btn-sm" onClick={()=>{setStudents(LS.get("__shared__"+STUDENTS_KEY)||[]);setModal("students");}}>👥</button>}
+            {isTeacher&&<button className="btn btn-ghost btn-sm" onClick={()=>setModal("firebase-setup")} style={{borderColor:fbConnected?"#43d98c44":"#ffb34744",color:fbConnected?"#43d98c":"#ffb347"}}>🔥</button>}
+            <button className="btn btn-ghost btn-sm" onClick={logout} style={{color:"#ff5370",borderColor:"#ff537044",padding:"4px 8px"}}>↩</button>
           </div>}
         </header>
+
+        {/* Mobile bottom nav */}
+        {curSess&&<nav style={{display:"none"}} id="mobile-nav" className="mobile-nav">
+          {[["ide","💻","Editor"],["marathon","🏃","Marathon"],["quiz","📝","Quizzes"],["whiteboard","🪧","Board"],["rewards","🏆","Rewards"]].map(([v,ico,lbl])=>(
+            <div key={v} onClick={()=>{setView(v);if(v==="marathon")refreshMarathon();if(v==="quiz")refreshQuizData();}}
+              style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2,padding:"6px 0",cursor:"pointer",color:view===v?T.accent:T.muted,borderTop:view===v?`2px solid ${T.accent}`:"2px solid transparent",transition:"all .15s",fontSize:9,fontWeight:700,userSelect:"none"}}>
+              <span style={{fontSize:18,lineHeight:1}}>{ico}</span>
+              <span>{lbl}</span>
+            </div>
+          ))}
+        </nav>}
 
         {/* ── IDE ── */}
         {view==="ide"&&(
